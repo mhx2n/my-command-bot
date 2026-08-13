@@ -13,7 +13,7 @@ import urllib.parse
 import sys
 from contextlib import closing, suppress
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, InputTextMessageContent, Poll, Update
 from telegram.constants import ParseMode
