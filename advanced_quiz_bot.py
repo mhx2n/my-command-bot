@@ -6394,40 +6394,142 @@ async def send_rich_or_html(
     html_text: str,
     reply_markup=None,
     plain: str = "",
-) -> bool:
-    """Try to deliver a native rich message; fall back to normal HTML."""
+    reply_to: Optional[int] = None,
+) -> int:
+    """Try to deliver a native rich message; fall back to normal HTML.
+
+    Returns the sent message id (or -1 when sent but the id is unknown, 0 on failure).
+    """
     if rich_available():
         try:
-            ok = await richfmt.send_rich(
+            mid = await richfmt.send_rich(
                 chat_id,
                 markdown,
                 reply_markup=reply_markup,
                 plain_fallback=plain or "result",
+                reply_to=reply_to,
             )
-            if ok:
-                return True
+            if mid:
+                return int(mid)
         except Exception:
             pass
-    with suppress(TelegramError, Exception):
-        await context.bot.send_message(
+    try:
+        sent = await context.bot.send_message(
             chat_id,
             html_text,
             parse_mode=ParseMode.HTML,
             reply_markup=reply_markup,
             disable_web_page_preview=True,
+            reply_to_message_id=reply_to or None,
         )
-        return True
-    return False
+        return int(getattr(sent, "message_id", -1) or -1)
+    except Exception:
+        with suppress(TelegramError, Exception):
+            sent = await context.bot.send_message(
+                chat_id,
+                html_text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=reply_markup,
+                disable_web_page_preview=True,
+            )
+            return int(getattr(sent, "message_id", -1) or -1)
+    return 0
 
 
 def _md(text: Any) -> str:
     return richfmt.md_escape(text) if richfmt else str(text)
 
 
+def _md_link(label: Any, url: Optional[str]):
+    if not richfmt:
+        return str(label)
+    return richfmt.md_link(label, url)
+
+
 def _md_table(headers, rows, aligns=None, cell_limit: int = 60) -> str:
     if not richfmt:
         return ""
     return richfmt.md_table(headers, rows, aligns, cell_limit)
+
+
+# ------------------------------------------------------------
+# Exam start card + result reply tracking
+# ------------------------------------------------------------
+
+_START_MSG_V8: Dict[str, int] = {}
+
+
+def _session_start_message_id(session) -> Optional[int]:
+    sid = str(base._row_value(session, "id", "") or "")
+    mid = _START_MSG_V8.get(sid)
+    if not mid:
+        with suppress(Exception):
+            mid = int(base._row_value(session, "status_message_id", 0) or 0)
+    return mid if mid and mid > 0 else None
+
+
+def _start_card_markdown(session) -> str:
+    title = str(base._row_value(session, "title", "Exam"))
+    return "\n".join([
+        f"# {title}",
+        "",
+        "## Exam Started",
+        "",
+        _md_table(
+            ["Item", "Value"],
+            [
+                ["Questions", base._row_value(session, "total_questions", 0)],
+                ["Time / question", f'{base._row_value(session, "question_time", 0)} sec'],
+                ["Negative / wrong", base._row_value(session, "negative_mark", 0)],
+                ["Status", "Running now"],
+            ],
+            ["l", "r"],
+        ),
+        "",
+        "- [x] Answer each poll before its timer ends",
+        "- [ ] Final result will arrive as a reply to this message",
+        "",
+        "---",
+        f"_{_md(base.CONFIG.brand_name)}_",
+    ])
+
+
+def _start_card_html(session) -> str:
+    return "\n".join([
+        f'<b>{base.html_escape(str(base._row_value(session, "title", "Exam")))}</b>',
+        "",
+        f'Questions: <b>{base._row_value(session, "total_questions", 0)}</b>',
+        f'Time / question: <b>{base._row_value(session, "question_time", 0)} sec</b>',
+        f'Negative / wrong: <b>{base._row_value(session, "negative_mark", 0)}</b>',
+        "",
+        "<b>Exam is running now.</b>",
+    ])
+
+
+_prev_start_countdown_v8 = base.start_exam_countdown
+
+
+async def _start_exam_countdown_v8(context, session_id: str, existing_message_id=None) -> None:
+    await _prev_start_countdown_v8(context, session_id, existing_message_id)
+    with suppress(Exception):
+        session = base.get_session(session_id)
+        if not session or str(session["status"]) != "running":
+            return
+        mid = await send_rich_or_html(
+            context,
+            int(session["chat_id"]),
+            _start_card_markdown(session),
+            _start_card_html(session),
+            plain=f'{session["title"]} — exam started',
+        )
+        if mid and mid > 0:
+            _START_MSG_V8[str(session_id)] = int(mid)
+            with suppress(Exception):
+                base.DBH.execute("UPDATE sessions SET status_message_id=? WHERE id=?", (int(mid), session_id))
+
+
+base.start_exam_countdown = _start_exam_countdown_v8
+
 
 
 # ------------------------------------------------------------
