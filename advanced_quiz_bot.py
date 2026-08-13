@@ -6636,13 +6636,18 @@ async def send_private_results(context, session_id: str) -> None:  # type: ignor
                 (session_id, item["q_no"]),
             )
             link = None
+            msg_id = 0
             with suppress(Exception):
-                link = base.get_message_link(int(session["chat_id"]), int(qrow["message_id"] or 0), username) if qrow else None
+                msg_id = int(qrow["message_id"] or 0) if qrow else 0
+            if msg_id > 0:
+                with suppress(Exception):
+                    link = base.get_message_link(int(session["chat_id"]), msg_id, username)
             label = f'<a href="{link}">Q{item["q_no"]}</a>' if link else f'Q{item["q_no"]}'
             buckets_html[item["status"]].append(label)
             buckets_plain[item["status"]].append(
                 f'[Q{item["q_no"]}]({link})' if link else f'Q{item["q_no"]}'
             )
+
         correct = int(rank_item["correct"])
         wrong = int(rank_item["wrong"])
         skipped = int(rank_item["skipped"])
