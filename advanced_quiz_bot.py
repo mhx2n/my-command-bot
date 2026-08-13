@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import json
+import math
 import random
 import re
 import unicodedata
@@ -9492,14 +9493,14 @@ base.build_app = _build_app_v16
 # ============================================================
 
 def _safe_negative_mark_v17(value: Any) -> float:
-    """Negative marking is a fraction of one correct mark, never an arbitrary score."""
+    """Keep every valid non-negative mark instead of silently changing it to zero."""
     try:
         parsed = float(value)
     except (TypeError, ValueError):
         return 0.0
-    if not (0.0 <= parsed <= 1.0):
+    if not math.isfinite(parsed) or parsed < 0.0:
         return 0.0
-    return round(parsed, 4)
+    return round(parsed, 6)
 
 
 _create_draft_before_v17 = base.create_draft
@@ -9550,6 +9551,22 @@ async def _authoritative_poll_answer_v17(update: Update, context: ContextTypes.D
         qrow = None
         for attempt in range(8):
             qrow = base.get_question_by_poll(str(answer.poll_id))
+            if qrow is None:
+                # Compatibility with restored/older databases where the poll
+                # id reached sessions before session_questions was committed.
+                qrow = base.DBH.fetchone(
+                    """
+                    SELECT sq.*, s.chat_id, s.title, s.question_time,
+                           s.negative_mark, s.total_questions,
+                           s.status AS session_status
+                    FROM sessions s
+                    JOIN session_questions sq
+                      ON sq.session_id=s.id AND sq.q_no=s.current_index
+                    WHERE s.active_poll_id=?
+                    LIMIT 1
+                    """,
+                    (str(answer.poll_id),),
+                )
             if qrow is not None:
                 break
             if attempt < 7:
@@ -9622,6 +9639,7 @@ async def _authoritative_poll_answer_v17(update: Update, context: ContextTypes.D
             )
             is_inbox = (
                 int(session["chat_id"]) == int(user.id)
+                or int(session["chat_id"]) > 0
                 or (chat_row is not None and str(chat_row["chat_type"]) == "private")
             )
             should_advance = inserted and is_inbox
@@ -9676,13 +9694,13 @@ _build_app_before_v17 = base.build_app
 
 
 def _build_app_v17():
-    # Repair historical corrupt values restored from old backups before they
-    # can leak into cards, scoring, or newly-created sessions.
+    # Repair only invalid values. Values above one are intentionally valid:
+    # older working builds allowed owners to choose any non-negative penalty.
     base.DBH.execute(
-        "UPDATE drafts SET negative_mark=0 WHERE negative_mark < 0 OR negative_mark > 1"
+        "UPDATE drafts SET negative_mark=0 WHERE negative_mark < 0"
     )
     base.DBH.execute(
-        "UPDATE sessions SET negative_mark=0 WHERE negative_mark < 0 OR negative_mark > 1"
+        "UPDATE sessions SET negative_mark=0 WHERE negative_mark < 0"
     )
     app = _build_app_before_v17()
     from telegram.ext import CommandHandler as _CH17, PollAnswerHandler as _PAH17
