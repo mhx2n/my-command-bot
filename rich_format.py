@@ -229,8 +229,21 @@ def md_escape(text: Any) -> str:
     return s
 
 
+class MDRaw(str):
+    """Marker for text that already contains valid markdown (links, bold…)."""
+
+
+def md_link(label: Any, url: Optional[str]) -> MDRaw:
+    text = md_cell(label, 80)
+    if not url:
+        return MDRaw(text)
+    return MDRaw(f"[{text}]({url})")
+
+
 def md_cell(text: Any, limit: int = 60) -> str:
     """Escape and flatten a value so it is safe inside a markdown table cell."""
+    if isinstance(text, MDRaw):
+        return re.sub(r"\s+", " ", str(text)).strip().replace("|", "\\|") or "—"
     s = str(text if text is not None else "")
     s = re.sub(r"\s+", " ", s).strip()
     if len(s) > limit:
@@ -239,6 +252,7 @@ def md_cell(text: Any, limit: int = 60) -> str:
     for ch in "`*_[]":
         s = s.replace(ch, "\\" + ch)
     return s or "—"
+
 
 
 def md_table(
