@@ -9536,6 +9536,7 @@ async def _authoritative_poll_answer_v17(update: Update, context: ContextTypes.D
     session_id = "unknown"
     qrow = None
     should_advance = False
+    handled = False
     try:
         answer = update.poll_answer
         user = answer.user if answer else None
@@ -9607,6 +9608,11 @@ async def _authoritative_poll_answer_v17(update: Update, context: ContextTypes.D
                     )
                     conn.commit()
                     inserted = True
+                # An existing answer is also handled: letting the legacy
+                # handler process it again cannot add value and may schedule a
+                # second private advance.  Failures before this point remain
+                # unhandled so the group=0 compatibility handler can retry.
+                handled = True
 
             # Groups keep the shared timer. A private practice belongs to
             # exactly one user, so the first answer advances immediately.
@@ -9659,7 +9665,11 @@ async def _authoritative_poll_answer_v17(update: Update, context: ContextTypes.D
                     name=f"advance:{session_id}:fallback:{qrow['q_no']}",
                 )
     finally:
-        raise ApplicationHandlerStop
+        # Do not swallow an update that this compatibility layer could not
+        # record.  The canonical handler registered at group=0 remains a
+        # retry-safe fallback for lookup/status/DB failures.
+        if handled:
+            raise ApplicationHandlerStop
 
 
 _build_app_before_v17 = base.build_app
