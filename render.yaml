@@ -29,3 +29,10 @@ services:
         value: 180
       - key: LOG_LEVEL
         value: INFO
+      - key: API_ID
+        sync: false
+      - key: API_HASH
+        sync: false
+      - key: RICH_FORMAT
+        value: 1
+
