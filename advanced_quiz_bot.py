@@ -6440,6 +6440,10 @@ def _md(text: Any) -> str:
     return richfmt.md_escape(text) if richfmt else str(text)
 
 
+def _md_raw(text: Any):
+    return richfmt.MDRaw(str(text)) if richfmt else str(text)
+
+
 def _md_link(label: Any, url: Optional[str]):
     if not richfmt:
         return str(label)
@@ -6542,7 +6546,7 @@ _prev_send_private_results_v8 = send_private_results
 def _build_rich_result_markdown(session, rank_item, section_data, buckets_plain, meta) -> str:
     title = str(session["title"])
     parts: List[str] = [f"# {title}", ""]
-    parts.append(_md_table(["\u2726 YOUR SCORE"], [[f'**{meta["score"]}**']], ["c"], 40))
+    parts.append(_md_table(["\u2726 YOUR SCORE \u2726"], [[_md_raw(f'**{meta["score"]}**')]], ["c"], 40))
     parts.append("")
     parts.append("## Result Summary")
     parts.append("")
