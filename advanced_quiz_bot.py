@@ -13,7 +13,7 @@ import urllib.parse
 import sys
 from contextlib import closing, suppress
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, InputTextMessageContent, Poll, Update
 from telegram.constants import ParseMode
@@ -8263,6 +8263,39 @@ def _share_group_url_v12(bot_username: str, draft_id: str) -> str:
     return f"https://t.me/{bot_username}?startgroup=tqxgrp_{draft_id}"
 
 
+_SHARE_NOTE_KEY_V13 = "share_card_note"
+_SHARE_NOTE_DEFAULT_V13 = ""
+
+
+def get_share_note_v13() -> str:
+    try:
+        return (get_setting(_SHARE_NOTE_KEY_V13, "") or "").strip()
+    except Exception:
+        return ""
+
+
+def _pad_cell_v13(text: str, width: int) -> str:
+    s = str(text)
+    if len(s) > width:
+        s = s[: width - 1] + "…"
+    return s + " " * (width - len(s))
+
+
+def _share_table_v13(rows: Sequence[Tuple[str, str]]) -> str:
+    lw = max(len(r[0]) for r in rows) + 1
+    rw = max(len(r[1]) for r in rows) + 1
+    top = "┌" + "─" * (lw + 1) + "┬" + "─" * (rw + 1) + "┐"
+    mid = "├" + "─" * (lw + 1) + "┼" + "─" * (rw + 1) + "┤"
+    bot = "└" + "─" * (lw + 1) + "┴" + "─" * (rw + 1) + "┘"
+    out = [top]
+    out.append("│ " + _pad_cell_v13("DETAIL", lw - 1) + "│ " + _pad_cell_v13("VALUE", rw - 1) + "│")
+    out.append(mid)
+    for label, value in rows:
+        out.append("│ " + _pad_cell_v13(label, lw - 1) + "│ " + _pad_cell_v13(value, rw - 1) + "│")
+    out.append(bot)
+    return "\n".join(out)
+
+
 def _share_card_html_v12(
     title: str,
     code: str,
@@ -8272,24 +8305,83 @@ def _share_card_html_v12(
     practice_url: str,
     html_url: str,
 ) -> str:
+    table = _share_table_v13(
+        [
+            ("Quiz ID", str(code)),
+            ("Questions", str(q_count)),
+            ("Time / Q", f"{q_time} sec"),
+            ("Negative", str(negative)),
+        ]
+    )
     lines = [
-        f"🎯 <b>{base.html_escape(title)}</b>",
-        "━━━━━━━━━━━━━━━━━━",
-        f"🧾 <b>Quiz ID</b> · <code>{base.html_escape(code)}</code>",
-        f"📚 <b>Questions</b> · <b>{q_count}</b>",
-        f"⏱️ <b>Time / question</b> · <b>{q_time} sec</b>",
-        f"➖ <b>Negative / wrong</b> · <b>{negative}</b>",
-        "",
-        "🚀 <b>কীভাবে দিবে</b>",
+        f"🎯 <b>{base.html_escape(title)}</b>  ✦",
+        f"<pre>{base.html_escape(table)}</pre>",
     ]
-    if practice_url:
-        lines.append(f'▪️ <a href="{practice_url}">এখানে ট্যাপ করে একা অনুশীলন করো</a>')
-    lines.append("▪️ গ্রুপে সবাই একসাথে দিতে নিচের বাটন ব্যবহার করো")
-    if html_url:
-        lines.append(f'▪️ <a href="{html_url}">অফলাইন HTML</a> ডাউনলোড করে ইন্টারনেট ছাড়াও দাও')
-    lines.append("")
-    lines.append("🏆 শেষে অটো রেজাল্ট ও র‍্যাংকিং পাবে।")
+    note = get_share_note_v13()
+    if note:
+        body = _sanitize_note_html_v13(note)
+        if practice_url:
+            body = body.replace("{practice}", practice_url).replace("{link}", practice_url)
+        if html_url:
+            body = body.replace("{offline}", html_url).replace("{html}", html_url)
+        lines.append(body)
     return "\n".join(lines)
+
+
+_NOTE_TAGS_V13 = ("b", "strong", "i", "em", "u", "ins", "s", "del", "code", "pre", "blockquote")
+
+
+def _sanitize_note_html_v13(note: str) -> str:
+    """Escape owner text but keep simple Telegram-safe formatting tags and links."""
+    body = base.html_escape(note)
+    for tag in _NOTE_TAGS_V13:
+        body = body.replace(f"&lt;{tag}&gt;", f"<{tag}>").replace(f"&lt;/{tag}&gt;", f"</{tag}>")
+    body = re.sub(
+        r'&lt;a href=(?:&quot;|")([^&"<>]+)(?:&quot;|")&gt;',
+        lambda m: f'<a href="{m.group(1)}">',
+        body,
+    )
+    body = body.replace("&lt;/a&gt;", "</a>")
+    return body
+
+
+async def cmd_sharenote_v13(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner/admin: set the text shown under the share card table."""
+    message = update.effective_message
+    user = update.effective_user
+    if not message or not user:
+        return
+    if not base.user_has_staff_access(user.id):
+        return
+    raw = (message.text or "")
+    parts = raw.split(None, 1)
+    body = parts[1].strip() if len(parts) > 1 else ""
+    if not body and message.reply_to_message:
+        body = (message.reply_to_message.text or message.reply_to_message.caption or "").strip()
+    if not body:
+        current = get_share_note_v13()
+        shown = base.html_escape(current) if current else "<i>(এখনো সেট করা হয়নি)</i>"
+        await message.reply_text(
+            "📝 <b>Share card note</b>\n\n"
+            f"{shown}\n\n"
+            "সেট করতে:\n<code>/sharenote আপনার লেখা\nএকাধিক লাইনও দিতে পারবেন</code>\n"
+            "মুছতে: <code>/sharenote off</code>\n\n"
+            "প্লেসহোল্ডার: <code>{practice}</code> · <code>{offline}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    if body.strip().lower() in {"off", "clear", "reset", "none"}:
+        set_setting(_SHARE_NOTE_KEY_V13, "")
+        await message.reply_text("🧹 Share card note মুছে ফেলা হয়েছে।")
+        return
+    set_setting(_SHARE_NOTE_KEY_V13, body)
+    await message.reply_text(
+        "✅ Share card note সেট হয়েছে:\n\n" + _sanitize_note_html_v13(body),
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
+
+
 
 
 def _share_markup_v12(practice_url: str, group_url: str, html_url: str, code: str) -> Optional[InlineKeyboardMarkup]:
@@ -8412,7 +8504,9 @@ def _build_app_v12():
         from telegram.ext import CommandHandler as _CH12
 
         app.add_handler(_CH12("start", _cmd_start_group_quiz_v12), group=-170)
+        app.add_handler(_CH12("sharenote", cmd_sharenote_v13), group=-170)
     return app
+
 
 
 base.build_app = _build_app_v12
