@@ -176,6 +176,7 @@ async def send_rich(
     markdown: str,
     reply_markup: Any = None,
     plain_fallback: str = "rich message",
+    reply_to: Optional[int] = None,
 ) -> bool:
     """Send a native rich markdown message. Returns True on success."""
     if not markdown or not markdown.strip():
@@ -192,14 +193,24 @@ async def send_rich(
             "message": plain_fallback[:200] or "rich message",
             "rich_message": types.InputRichMessageMarkdown(markdown=markdown),  # type: ignore[union-attr]
         }
+        if reply_to:
+            try:
+                kwargs["reply_to"] = types.InputReplyToMessage(reply_to_msg_id=int(reply_to))  # type: ignore[union-attr]
+            except Exception:
+                pass
         markup = _convert_markup(reply_markup)
         if markup is not None:
             kwargs["reply_markup"] = markup
-        await client(functions.messages.SendMessageRequest(**kwargs))  # type: ignore[union-attr]
+        try:
+            await client(functions.messages.SendMessageRequest(**kwargs))  # type: ignore[union-attr]
+        except Exception:
+            kwargs.pop("reply_to", None)
+            await client(functions.messages.SendMessageRequest(**kwargs))  # type: ignore[union-attr]
         return True
     except Exception as exc:
         logger.info("Rich send failed for %s: %s", chat_id, exc)
         return False
+
 
 
 # ------------------------------------------------------------
