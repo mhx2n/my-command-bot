@@ -8991,3 +8991,326 @@ def _build_app_v14():
 
 
 base.build_app = _build_app_v14
+
+
+# ============================================================
+# Patch v15
+#   1) Cumulative (additive) GitHub backup + full restore
+#   2) Fixed, professional HTML exam theme (no random rotation)
+# ============================================================
+
+# ------------------------------------------------------------
+# 1) Cumulative backup vault
+# ------------------------------------------------------------
+
+def _pk_cols_v15(conn: Any, table: str) -> List[str]:
+    try:
+        info = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    except Exception:
+        return []
+    return [str(r[1]) for r in info if int(r[5] or 0) > 0]
+
+
+def _row_key_v15(row: Dict[str, Any], pks: List[str]) -> str:
+    if pks and all(c in row for c in pks):
+        return "pk::" + "\u0001".join(str(row.get(c)) for c in pks)
+    try:
+        return "row::" + json.dumps(row, sort_keys=True, ensure_ascii=False, default=str)
+    except Exception:
+        return "row::" + repr(sorted(row.items()))
+
+
+def _merge_tables_v15(old: Any, new: Any) -> Dict[str, List[Dict[str, Any]]]:
+    """Union old + new rows per table. Newer rows win on primary-key clash."""
+    out: Dict[str, List[Dict[str, Any]]] = {}
+    if isinstance(old, dict):
+        for t, rows in old.items():
+            if isinstance(rows, list):
+                out[t] = [r for r in rows if isinstance(r, dict)]
+    if not isinstance(new, dict):
+        return out
+    pk_cache: Dict[str, List[str]] = {}
+    with closing(base.DBH.connect()) as conn:
+        for table, rows in new.items():
+            if not isinstance(rows, list):
+                continue
+            if table not in pk_cache:
+                pk_cache[table] = _pk_cols_v15(conn, table)
+            pks = pk_cache[table]
+            merged: Dict[str, Dict[str, Any]] = {}
+            for r in out.get(table, []):
+                merged[_row_key_v15(r, pks)] = r
+            for r in rows:
+                if isinstance(r, dict):
+                    merged[_row_key_v15(r, pks)] = r
+            out[table] = list(merged.values())
+    return out
+
+
+def _download_payload_v15(path: str) -> Dict[str, Any]:
+    try:
+        raw = base._download_github_file_bytes(path)
+    except Exception:
+        return {}
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _count_rows_v15(tables: Any) -> int:
+    if not isinstance(tables, dict):
+        return 0
+    return sum(len(v or []) for v in tables.values() if isinstance(v, list))
+
+
+def _backup_now_v15() -> Dict[str, Any]:
+    """Owner-triggered backup. Never deletes: merges local data into the
+    existing remote backup so everything ever backed up stays available."""
+    local = export_backup_payload_v8()
+    local_tables = local.get("tables") or {}
+    remote = _download_payload_v15(base.GITHUB_STATE_PATH)
+    remote_tables = remote.get("tables") if isinstance(remote, dict) else {}
+    merged_tables = _merge_tables_v15(remote_tables, local_tables)
+    payload = {
+        "version": 3,
+        "mode": "cumulative",
+        "generated_at": base.now_ts(),
+        "brand_name": base.CONFIG.brand_name,
+        "tables": merged_tables,
+    }
+    main_size = _gh_upload_json_v14(base.GITHUB_STATE_PATH, payload, "Cumulative bot state backup")
+    stamp = _dt_v14.now().strftime("%Y%m%d-%H%M%S")
+    snap_path = f"{_snapshot_dir_v14()}/state-{stamp}.json"
+    snap_size = 0
+    with suppress(Exception):
+        snap_size = _gh_upload_json_v14(
+            snap_path,
+            {"version": 3, "mode": "snapshot", "generated_at": base.now_ts(), "tables": local_tables},
+            f"Snapshot backup {stamp}",
+        )
+    return {
+        "rows": _count_rows_v15(merged_tables),
+        "new_rows": _count_rows_v15(local_tables),
+        "tables": len(merged_tables),
+        "main_size": main_size,
+        "snapshot_path": snap_path if snap_size else "",
+        "snapshot_size": snap_size,
+    }
+
+
+def _apply_tables_v15(tables: Any) -> int:
+    if not isinstance(tables, dict):
+        return 0
+    restored = 0
+    with closing(base.DBH.connect()) as conn:
+        for table, rows in tables.items():
+            if not isinstance(rows, list) or not _table_exists_v8(conn, table):
+                continue
+            columns = _table_columns_v8(conn, table)
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                cols = [c for c in columns if c in row]
+                if not cols:
+                    continue
+                sql = (
+                    f"INSERT OR REPLACE INTO {table}({','.join(cols)}) "
+                    f"VALUES({','.join('?' for _ in cols)})"
+                )
+                try:
+                    conn.execute(sql, tuple(row.get(c) for c in cols))
+                    restored += 1
+                except Exception:
+                    continue
+        conn.commit()
+    for row in (tables.get("user_visuals") or []):
+        with suppress(Exception):
+            base.restore_thumbnail_file_from_github(int(row.get("user_id")), row.get("thumb_github_path"))
+    return restored
+
+
+def _restore_everything_v15() -> Tuple[bool, int]:
+    """Restore the merged main backup plus every snapshot, so nothing is lost."""
+    tables: Dict[str, List[Dict[str, Any]]] = {}
+    main = _download_payload_v15(base.GITHUB_STATE_PATH)
+    tables = _merge_tables_v15(tables, main.get("tables") if isinstance(main, dict) else {})
+    for snap in sorted(_gh_list_dir_v14(_snapshot_dir_v14()), key=lambda x: x["name"]):
+        data = _download_payload_v15(snap["path"])
+        tables = _merge_tables_v15(tables, data.get("tables") if isinstance(data, dict) else {})
+    restored = _apply_tables_v15(tables)
+    base.logger.info("Full restore complete: %s rows", restored)
+    return restored > 0, restored
+
+
+def _restore_from_path_v15(path: str) -> Tuple[bool, int]:
+    if not path or path == base.GITHUB_STATE_PATH:
+        return _restore_everything_v15()
+    data = _download_payload_v15(path)
+    tables = data.get("tables") if isinstance(data, dict) else None
+    if not isinstance(tables, dict):
+        return False, 0
+    restored = _apply_tables_v15(tables)
+    base.logger.info("Restore complete: %s rows from %s", restored, path)
+    return restored > 0, restored
+
+
+# Re-point the v14 vault handlers at the cumulative implementations.
+_backup_now_v14 = _backup_now_v15  # type: ignore[assignment]
+_restore_from_path_v14 = _restore_from_path_v15  # type: ignore[assignment]
+
+
+def _db_is_empty_v15() -> bool:
+    try:
+        with closing(base.DBH.connect()) as conn:
+            for table in ("drafts", "known_users", "sessions", "practice_links"):
+                if not _table_exists_v8(conn, table):
+                    continue
+                row = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
+                if row and int(row[0] or 0) > 0:
+                    return False
+    except Exception:
+        return False
+    return True
+
+
+def _auto_restore_on_boot_v15() -> None:
+    """After a restart the local disk can be wiped — pull everything back."""
+    if not _gh_ready_v14():
+        return
+    if not _db_is_empty_v15():
+        return
+    with suppress(Exception):
+        ok, rows = _restore_everything_v15()
+        if ok:
+            base.logger.info("Boot restore: %s rows recovered from GitHub backup.", rows)
+
+
+async def _guarded_backup_cmd_v15(handler, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    try:
+        await handler(update, context)
+    except ApplicationHandlerStop:
+        raise
+    except Exception as exc:
+        base.logger.exception("Backup command failed")
+        if message:
+            with suppress(Exception):
+                await message.reply_text(
+                    f"❌ Backup error: <code>{base.html_escape(str(exc))}</code>",
+                    parse_mode=ParseMode.HTML,
+                )
+        raise ApplicationHandlerStop
+
+
+async def cmd_backups_v15(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _guarded_backup_cmd_v15(cmd_backups_v14, update, context)
+
+
+async def cmd_backupnow_v15(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _guarded_backup_cmd_v15(cmd_backupnow_v14, update, context)
+
+
+async def cmd_restorebackup_v15(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _guarded_backup_cmd_v15(cmd_restorebackup_v14, update, context)
+
+
+async def on_backup_cb_v15(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    try:
+        await on_backup_cb_v14(update, context)
+    except ApplicationHandlerStop:
+        raise
+    except Exception as exc:
+        base.logger.exception("Backup callback failed")
+        with suppress(Exception):
+            await update.callback_query.answer(f"Error: {exc}"[:190], show_alert=True)
+        raise ApplicationHandlerStop
+
+
+_orig_build_app_v15 = base.build_app
+
+
+def _build_app_v15():
+    app = _orig_build_app_v15()
+    with suppress(Exception):
+        from telegram.ext import CallbackQueryHandler as _CQ15, CommandHandler as _CH15
+
+        app.add_handler(_CH15(["backups", "backupvault"], cmd_backups_v15), group=-500)
+        app.add_handler(_CH15("backupnow", cmd_backupnow_v15), group=-500)
+        app.add_handler(_CH15(["restorebackup", "restoreall"], cmd_restorebackup_v15), group=-500)
+        app.add_handler(_CQ15(on_backup_cb_v15, pattern=r"^bk14:"), group=-500)
+    with suppress(Exception):
+        _auto_restore_on_boot_v15()
+    return app
+
+
+base.build_app = _build_app_v15
+
+
+# ------------------------------------------------------------
+# 2) Fixed, readable exam theme
+# ------------------------------------------------------------
+
+_DARK_THEME_IDS_V15 = {"midnight", "forest"}
+
+
+def _theme_readability_css_v15() -> str:
+    parts: List[str] = [
+        "\n/* v15: fixed theme + professional readability */\n"
+        "#toggleThemeBtn{display:none!important}\n"
+        ".theme-row,.theme-picker{display:none!important}\n"
+        ".q-index{color:var(--accent)!important;letter-spacing:.5px}\n"
+        ".q-text,.opt-body,.review-q,.answer-line,.headline,.result-title,.stat .value,.timer-box .value"
+        "{color:var(--text)!important}\n"
+        ".muted,.q-section,.stat .label,.timer-box .label,.brand .meta{color:var(--muted)!important}\n"
+        ".card,.question-card,.review-card,.stat,.bubble,.opt,.chip,.tab"
+        "{border-color:var(--border)!important}\n"
+        ".opt{background:var(--surface-2)!important;color:var(--text)!important}\n"
+        ".opt.selected{background:var(--accent-soft)!important;border-color:var(--accent)!important}\n"
+        ".opt-label{color:var(--accent)!important}\n"
+        ".btn.primary,.fab.primary,.tab.active{background:var(--accent)!important;color:#ffffff!important}\n"
+        ".btn.secondary{background:var(--surface-2)!important;color:var(--text)!important}\n"
+        ".input,.input::placeholder{color:var(--text)}\n"
+        ".input::placeholder{opacity:.62}\n"
+        ".q-image{background:#ffffff!important}\n"
+        ".bar > span{background:linear-gradient(90deg,var(--accent),var(--success,#22c55e))!important}\n"
+        ".bubble.answered{background:var(--accent-soft)!important;border-color:var(--accent)!important}\n"
+        ".review-card.correct{border-left-color:var(--success)!important}\n"
+        ".review-card.wrong{border-left-color:var(--danger)!important}\n"
+        ".review-card.skipped{border-left-color:var(--warning)!important}\n"
+        ".q-text,.opt-body{font-weight:650;letter-spacing:.1px}\n"
+    ]
+    for t in _HTML_EXAM_THEMES:
+        dark = t["id"] in _DARK_THEME_IDS_V15
+        success = "#4ade80" if dark else "#15803d"
+        danger = "#f87171" if dark else "#b91c1c"
+        warning = "#fbbf24" if dark else "#b45309"
+        shadow = "0 18px 48px rgba(0,0,0,.45)" if dark else "0 14px 36px rgba(15,23,42,.10)"
+        parts.append(
+            f'body[data-exam-theme="{t["id"]}"]{{'
+            f"--success:{success};--danger:{danger};--warning:{warning};--shadow:{shadow};"
+            f"}}\n"
+        )
+    return "".join(parts)
+
+
+_orig_render_scroll_exam_html_v15 = render_scroll_exam_html
+
+
+def render_scroll_exam_html(draft: Any, owner_id: int) -> str:  # type: ignore[no-redef]
+    html = _orig_render_scroll_exam_html_v15(draft, owner_id)
+    # The theme must never rotate per student/browser: always the owner default.
+    html = html.replace("localStorage.getItem('examThemeId')", "null")
+    html = html.replace("try{localStorage.setItem('examThemeId', t.id);}catch(e){}", "")
+    html = html.replace(
+        '<div class="theme-row">'
+        '<div class="lbl">🎨 Choose a theme</div>'
+        '<div id="themePicker" class="theme-picker"></div>'
+        '</div>',
+        "",
+    )
+    html = html.replace("</style>", _theme_readability_css_v15() + "</style>", 1)
+    return html
