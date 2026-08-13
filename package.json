@@ -3,6 +3,9 @@
   "private": true,
   "version": "0.0.0",
   "scripts": {
-    "dev": "node dev-stub.cjs"
+    "dev": "node dev-stub.cjs",
+    "build": "node -e \"console.log('Python bot project: no JS build step required.')\"",
+    "build:dev": "node -e \"console.log('Python bot project: no JS build step required.')\"",
+    "preview": "node dev-stub.cjs"
   }
 }
