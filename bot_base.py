@@ -1731,15 +1731,19 @@ async def begin_or_advance_exam(context: ContextTypes.DEFAULT_TYPE, session_id: 
 async def close_poll_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     session_id = context.job.data["session_id"]
     q_no = context.job.data["q_no"]
-    session = get_session(session_id)
-    if not session or session["status"] != "running":
-        return
-    q = get_session_question(session_id, q_no)
-    if not q:
-        return
-    # Poll already auto-closes because send_poll uses open_period.
-    set_session_active_poll(session_id, None, None)
-    context.job_queue.run_once(begin_or_advance_exam_job, when=0.8, data={"session_id": session_id}, name=f"advance:{session_id}")
+    # Serialize timeout advancement with answer recording. At the timer edge a
+    # PollAnswer and this job can arrive concurrently; advancing first used to
+    # make that valid group vote unmappable or "not running" at finalization.
+    async with _operation_lock(context, f"exam-answer:{session_id}"):
+        session = get_session(session_id)
+        if not session or session["status"] != "running":
+            return
+        q = get_session_question(session_id, q_no)
+        if not q or int(session["current_index"] or 0) != int(q_no):
+            return
+        # Poll already auto-closes because send_poll uses open_period.
+        set_session_active_poll(session_id, None, None)
+        await begin_or_advance_exam(context, session_id)
 
 
 async def finish_exam(context: ContextTypes.DEFAULT_TYPE, session_id: str, reason: str = "completed") -> None:
