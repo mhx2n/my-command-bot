@@ -6365,5 +6365,710 @@ except Exception:
     pass
 
 
+
+# ============================================================
+# Patch v8 — Rich message formatting, manual-only GitHub backup,
+# and CSV/draft "Set Builder" (split a big draft into equal sets)
+# ============================================================
+
+import math as _math
+
+try:
+    import rich_format as richfmt
+except Exception:  # pragma: no cover
+    richfmt = None  # type: ignore
+
+
+def rich_available() -> bool:
+    return bool(richfmt and richfmt.rich_configured())
+
+
+def rich_status() -> str:
+    return richfmt.rich_status_text() if richfmt else "rich_format module missing"
+
+
+async def send_rich_or_html(
+    context,
+    chat_id: int,
+    markdown: str,
+    html_text: str,
+    reply_markup=None,
+    plain: str = "",
+) -> bool:
+    """Try to deliver a native rich message; fall back to normal HTML."""
+    if rich_available():
+        try:
+            ok = await richfmt.send_rich(
+                chat_id,
+                markdown,
+                reply_markup=reply_markup,
+                plain_fallback=plain or "result",
+            )
+            if ok:
+                return True
+        except Exception:
+            pass
+    with suppress(TelegramError, Exception):
+        await context.bot.send_message(
+            chat_id,
+            html_text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=reply_markup,
+            disable_web_page_preview=True,
+        )
+        return True
+    return False
+
+
+def _md(text: Any) -> str:
+    return richfmt.md_escape(text) if richfmt else str(text)
+
+
+def _md_table(headers, rows, aligns=None, cell_limit: int = 60) -> str:
+    if not richfmt:
+        return ""
+    return richfmt.md_table(headers, rows, aligns, cell_limit)
+
+
+# ------------------------------------------------------------
+# 1) Rich personal result (table based)
+# ------------------------------------------------------------
+
+_prev_send_private_results_v8 = send_private_results
+
+
+def _build_rich_result_markdown(session, rank_item, section_data, buckets_plain, meta) -> str:
+    title = str(session["title"])
+    parts: List[str] = [f"# {title}", ""]
+    parts.append("## Result Summary")
+    parts.append("")
+    parts.append(
+        _md_table(
+            ["Metric", "Value"],
+            [
+                ["Score", meta["score"]],
+                ["Rank", meta["rank"]],
+                ["Correct", meta["correct"]],
+                ["Wrong", meta["wrong"]],
+                ["Skipped", meta["skipped"]],
+                ["Accuracy", meta["accuracy"]],
+                ["Percentage", meta["percentage"]],
+                ["Percentile", meta["percentile"]],
+                ["Time", meta["duration"]],
+                ["Negative / wrong", meta["negative"]],
+            ],
+            ["l", "r"],
+        )
+    )
+    parts.append("")
+    if section_data and (len(section_data) > 1 or section_data[0]["title"] != "General"):
+        parts.append("## Section Analysis")
+        parts.append("")
+        parts.append(
+            _md_table(
+                ["Section", "Correct", "Wrong", "Skipped"],
+                [[s["title"], s["correct"], s["wrong"], s["skipped"]] for s in section_data],
+                ["l", "c", "c", "c"],
+                40,
+            )
+        )
+        parts.append("")
+    parts.append("## Question Breakdown")
+    parts.append("")
+    parts.append(
+        _md_table(
+            ["Status", "Questions"],
+            [
+                ["Correct", buckets_plain["correct"] or "—"],
+                ["Wrong", buckets_plain["wrong"] or "—"],
+                ["Skipped", buckets_plain["skipped"] or "—"],
+            ],
+            ["l", "l"],
+            220,
+        )
+    )
+    parts.append("")
+    parts.append("---")
+    parts.append(f"_{_md(base.CONFIG.brand_name)}_")
+    return "\n".join(parts)
+
+
+async def send_private_results(context, session_id: str) -> None:  # type: ignore[no-redef]
+    """Rich (table) personal result with automatic HTML fallback."""
+    if not rich_available():
+        return await _prev_send_private_results_v8(context, session_id)
+    session = base.get_session(session_id)
+    if not session:
+        return
+    chat_row = base.DBH.fetchone("SELECT username FROM known_chats WHERE chat_id=?", (session["chat_id"],))
+    username = chat_row["username"] if chat_row else None
+    ranking = base.get_session_ranking(session_id)
+    rank_map = {int(r["user_id"]): r for r in ranking}
+    participants = base.DBH.fetchall("SELECT * FROM participants WHERE session_id=? AND eligible=1", (session_id,))
+    total_users = max(1, len(ranking))
+    for p in participants:
+        user_id = int(p["user_id"])
+        row = base.DBH.fetchone("SELECT started FROM known_users WHERE user_id=?", (user_id,))
+        if not row or int(row["started"] or 0) != 1:
+            continue
+        try:
+            if not await base.is_required_channel_member(context, user_id):
+                continue
+        except Exception:
+            pass
+        rank_item = rank_map.get(user_id)
+        if not rank_item:
+            continue
+        review_items = _user_review_items(session_id, user_id)
+        section_data = _section_breakdown_for_user(session_id, user_id)
+        buckets_html = {"correct": [], "wrong": [], "skipped": []}
+        buckets_plain = {"correct": [], "wrong": [], "skipped": []}
+        for item in review_items:
+            qrow = base.DBH.fetchone(
+                "SELECT message_id FROM session_questions WHERE session_id=? AND q_no=?",
+                (session_id, item["q_no"]),
+            )
+            link = None
+            with suppress(Exception):
+                link = base.get_message_link(int(session["chat_id"]), int(qrow["message_id"] or 0), username) if qrow else None
+            label = f'<a href="{link}">Q{item["q_no"]}</a>' if link else f'Q{item["q_no"]}'
+            buckets_html[item["status"]].append(label)
+            buckets_plain[item["status"]].append(
+                f'[Q{item["q_no"]}]({link})' if link else f'Q{item["q_no"]}'
+            )
+        correct = int(rank_item["correct"])
+        wrong = int(rank_item["wrong"])
+        skipped = int(rank_item["skipped"])
+        attempted = max(1, correct + wrong)
+        accuracy = (correct / attempted) * 100.0
+        percentage = (correct / max(1, int(session["total_questions"]))) * 100.0
+        percentile = 100.0 if total_users <= 1 else ((total_users - int(rank_item["rank"])) / (total_users - 1)) * 100.0
+        duration_label = base.fmt_elapsed(int(rank_item.get("time_seconds") or 0))
+        meta = {
+            "score": str(rank_item["score"]),
+            "rank": f'#{rank_item["rank"]} / {total_users}',
+            "correct": str(correct),
+            "wrong": str(wrong),
+            "skipped": str(skipped),
+            "accuracy": f"{accuracy:.2f}%",
+            "percentage": f"{percentage:.2f}%",
+            "percentile": f"{percentile:.2f}%",
+            "duration": duration_label,
+            "negative": str(session["negative_mark"]),
+        }
+        markdown = _build_rich_result_markdown(
+            session,
+            rank_item,
+            section_data,
+            {k: ", ".join(v) for k, v in buckets_plain.items()},
+            meta,
+        )
+        html_lines = [
+            f'<b>{base.html_escape(session["title"])}</b>',
+            "",
+            f'৻ꪆ Score: <b>{meta["score"]}</b>',
+            f"◆ Correct: <b>{correct}</b>   ✕ Wrong: <b>{wrong}</b>   − Skipped: <b>{skipped}</b>",
+            f'⏱ Time: <b>{duration_label}</b>',
+            f'◉ Accuracy: <b>{meta["accuracy"]}</b>   ▦ Percentage: <b>{meta["percentage"]}</b>',
+            f'Negative / wrong: <b>{session["negative_mark"]}</b>',
+            "",
+        ]
+        if section_data and (len(section_data) > 1 or section_data[0]["title"] != "General"):
+            html_lines.append("<b>Section Analysis</b>")
+            for item in section_data:
+                html_lines.append(
+                    f'• {base.html_escape(item["title"])} — ◆ {item["correct"]}  ✕ {item["wrong"]}  − {item["skipped"]}'
+                )
+            html_lines.append("")
+        html_lines.extend(
+            [
+                "<b>Correct</b>",
+                ", ".join(buckets_html["correct"]) or "—",
+                "",
+                "<b>Wrong</b>",
+                ", ".join(buckets_html["wrong"]) or "—",
+                "",
+                "<b>Skipped</b>",
+                ", ".join(buckets_html["skipped"]) or "—",
+            ]
+        )
+        buttons: List[List[InlineKeyboardButton]] = []
+        practice_url = _build_practice_url_v4(
+            context.bot_data.get("bot_username", ""), str(session["draft_id"]), int(session["created_by"])
+        )
+        if practice_url:
+            buttons.append([InlineKeyboardButton("↺ Try Again", url=practice_url)])
+        markup = InlineKeyboardMarkup(buttons) if buttons else None
+        await send_rich_or_html(
+            context,
+            user_id,
+            markdown,
+            "\n".join(html_lines),
+            reply_markup=markup,
+            plain=f'{session["title"]} — result',
+        )
+        with suppress(Exception):
+            html_doc = render_user_result_html(session, p, rank_item, ranking, review_items, section_data)
+            await context.bot.send_document(
+                user_id,
+                document=InputFile(
+                    base.io.BytesIO(html_doc.encode("utf-8")),
+                    filename=f"{base.pdf_safe_filename(session['title'])}_result.html",
+                ),
+                caption="▤ HTML result report.",
+            )
+
+
+base.send_private_results = send_private_results
+
+
+# ------------------------------------------------------------
+# 2) Rich scoreboard for admins / owners / group
+# ------------------------------------------------------------
+
+def _ranking_markdown(session, ranking, limit: int = 50) -> str:
+    title = str(session["title"] if not isinstance(session, dict) else session.get("title", "Exam"))
+    rows = []
+    for item in ranking[:limit]:
+        name = str(item.get("name") or "")
+        if item.get("sub_name"):
+            name = f"{name} {item['sub_name']}"
+        rows.append([
+            item.get("rank", "-"),
+            name,
+            item.get("score", "0"),
+            item.get("correct", 0),
+            item.get("wrong", 0),
+            item.get("skipped", 0),
+            item.get("time_label", item.get("time", "-")),
+        ])
+    md = [f"# {title}", "", "## Final Scoreboard", ""]
+    md.append(
+        _md_table(
+            ["#", "Name", "Score", "✔", "✘", "–", "Time"],
+            rows or [["—", "No eligible participants", "—", "—", "—", "—", "—"]],
+            ["c", "l", "r", "c", "c", "c", "r"],
+            34,
+        )
+    )
+    md.append("")
+    md.append(f"Total participants: **{len(ranking)}**")
+    md.append("")
+    md.append("---")
+    md.append(f"_{_md(base.CONFIG.brand_name)}_")
+    return "\n".join(md)
+
+
+_prev_send_admin_text_results_v8 = base.send_admin_text_results
+
+
+async def _rich_send_admin_text_results(context, session, ranking):
+    with suppress(Exception):
+        chat_id_val = int(session.get("chat_id") if isinstance(session, dict) else session["chat_id"])
+        if chat_id_val > 0:
+            return
+    if not rich_available():
+        return await _prev_send_admin_text_results_v8(context, session, ranking)
+    markdown = _ranking_markdown(session, ranking)
+    html_text = base.build_group_result_text(session, ranking, full=True)
+    recipients: List[int] = []
+    creator_id = int(base._row_value(session, "created_by", 0) or 0)
+    for uid in [creator_id] + list(base.CONFIG.owner_ids) + base.all_admin_ids():
+        if uid and uid not in recipients:
+            recipients.append(uid)
+    for uid in recipients:
+        await send_rich_or_html(context, uid, markdown, html_text[:3800], plain="Exam scoreboard")
+
+
+base.send_admin_text_results = _rich_send_admin_text_results
+
+
+_prev_finish_exam_v8 = base.finish_exam
+
+
+async def _finish_exam_with_rich_board(context, session_id: str, reason: str = "completed") -> None:
+    session = base.get_session(session_id)
+    chat_id = int(session["chat_id"]) if session else 0
+    await _prev_finish_exam_v8(context, session_id, reason)
+    if not rich_available() or chat_id >= 0 or not session:
+        return
+    with suppress(Exception):
+        ranking = base.get_session_ranking(session_id)
+        await send_rich_or_html(
+            context,
+            chat_id,
+            _ranking_markdown(session, ranking, limit=base.CONFIG.scoreboard_top_n),
+            base.build_group_result_text(session, ranking, full=False)[:3800],
+            plain="Final scoreboard",
+        )
+
+
+base.finish_exam = _finish_exam_with_rich_board
+
+
+# ------------------------------------------------------------
+# 3) Set Builder — split a draft into equal question sets
+# ------------------------------------------------------------
+
+SET_SIZE_PRESETS = [20, 25, 30, 35, 40, 45, 50, 55, 60, 70]
+
+
+def build_sets_from_draft(draft_id: str, per_set: int, actor_id: int) -> List[Dict[str, Any]]:
+    """Split every question of a draft into equal sets (last set keeps the rest)."""
+    draft = base.get_draft(draft_id)
+    if not draft:
+        raise ValueError("Draft not found")
+    per_set = max(1, int(per_set))
+    questions = list(base.get_draft_questions(draft_id))
+    if not questions:
+        raise ValueError("This draft has no questions yet.")
+    owner_id = int(draft["owner_id"] or actor_id)
+    base_title = str(draft["title"] or "Exam").strip()
+    total_sets = _math.ceil(len(questions) / per_set)
+    created: List[Dict[str, Any]] = []
+    for index in range(total_sets):
+        chunk = questions[index * per_set:(index + 1) * per_set]
+        if not chunk:
+            continue
+        new_id = base.create_draft(
+            owner_id,
+            f"{base_title} — Set {index + 1}",
+            int(draft["question_time"]),
+            float(draft["negative_mark"]),
+        )
+        for row in chunk:
+            base.add_question_to_draft(
+                new_id,
+                str(row["question"]),
+                [str(x) for x in (base.jload(row["options"], []) or [])],
+                int(row["correct_option"]),
+                str(row["explanation"] or ""),
+                str(row["src"] or "set"),
+            )
+        created.append({
+            "set_no": index + 1,
+            "draft_id": new_id,
+            "title": f"{base_title} — Set {index + 1}",
+            "count": len(chunk),
+        })
+    return created
+
+
+def _sets_menu_markup(draft_id: str, page: int) -> InlineKeyboardMarkup:
+    rows: List[List[InlineKeyboardButton]] = []
+    row: List[InlineKeyboardButton] = []
+    for size in SET_SIZE_PRESETS:
+        row.append(InlineKeyboardButton(str(size), callback_data=f"ux8:mk:{draft_id}:{page}:{size}"))
+        if len(row) == 5:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("✎ Custom number", callback_data=f"ux8:custom:{draft_id}:{page}")])
+    rows.append([InlineKeyboardButton("◂️ Back", callback_data=f"ux:open:{draft_id}:{page}")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _sets_menu_text(draft_id: str) -> str:
+    total = _calc_total_draft_questions(draft_id)
+    draft = base.get_draft(draft_id)
+    title = base.html_escape(draft["title"]) if draft else draft_id
+    lines = [
+        "<b>Set Builder</b>",
+        f"Draft: <b>{title}</b>",
+        f"Total questions: <b>{total}</b>",
+        "",
+        "Choose how many questions each set should contain.",
+        "Every set gets its own exam + practice link, in serial order.",
+        "The last set keeps the remaining questions.",
+    ]
+    return "\n".join(lines)
+
+
+async def _deliver_sets(context, chat_id: int, user_id: int, draft_id: str, per_set: int) -> None:
+    try:
+        created = build_sets_from_draft(draft_id, per_set, user_id)
+    except Exception as exc:
+        with suppress(Exception):
+            await context.bot.send_message(chat_id, f"▲️ Could not build sets: {base.html_escape(str(exc))}", parse_mode=ParseMode.HTML)
+        return
+    bot_username = context.bot_data.get("bot_username", "")
+    rows = []
+    html_lines = ["<b>Sets created</b>", ""]
+    for item in created:
+        url = _build_practice_url_v4(bot_username, item["draft_id"], user_id) or "—"
+        rows.append([f"Set {item['set_no']}", item["count"], item["draft_id"], f"[Open]({url})" if url != "—" else "—"])
+        html_lines.append(
+            f"<b>Set {item['set_no']}</b> — {item['count']} Q — <code>{item['draft_id']}</code>"
+            + (f' — <a href="{url}">Practice link</a>' if url != "—" else "")
+        )
+    markdown = "\n".join([
+        "# Set Builder",
+        "",
+        f"Questions per set: **{per_set}** • Total sets: **{len(created)}**",
+        "",
+        _md_table(["Set", "Questions", "Code", "Practice"], rows, ["c", "c", "l", "l"], 80),
+        "",
+        "> Each set is a full exam. Share the practice link, or bind the code in a group with `/binddraft CODE`.",
+    ])
+    await send_rich_or_html(context, chat_id, markdown, "\n".join(html_lines), plain="Sets created")
+
+
+# Add the Set Builder button to the draft edit panel.
+_prev_build_draft_detail_v8 = _build_draft_detail_text_markup
+
+
+def _build_draft_detail_text_markup(user_id: int, draft_id: str, page: int = 0, header: str = "", bot_username: str = ""):  # type: ignore[no-redef]
+    text, markup = _prev_build_draft_detail_v8(user_id, draft_id, page, header, bot_username)
+    with suppress(Exception):
+        rows = [list(r) for r in markup.inline_keyboard]
+        rows.insert(
+            max(0, len(rows) - 1),
+            [InlineKeyboardButton("❐ Set Builder", callback_data=f"ux8:sets:{draft_id}:{page}")],
+        )
+        markup = InlineKeyboardMarkup(rows)
+    return text, markup
+
+
+_prev_callback_router_v8 = base.callback_router
+
+
+async def _callback_router_v8(update: Update, context) -> None:
+    query = update.callback_query
+    if not query or not query.data or not query.data.startswith("ux8:"):
+        return await _prev_callback_router_v8(update, context)
+    user = query.from_user
+    await query.answer()
+    if not user or not base.user_has_staff_access(user.id):
+        return
+    parts = query.data.split(":")
+    action = parts[1] if len(parts) > 1 else ""
+    draft_id = parts[2] if len(parts) > 2 else ""
+    page = _safe_int(parts[3]) if len(parts) > 3 else 0
+    if not resolve_editable_draft(user.id, draft_id):
+        with suppress(Exception):
+            await base.panel_show_message(query.message, user.id, "▲️ Draft not found or access denied.")
+        return
+    if action == "sets":
+        with suppress(Exception):
+            await base.panel_show_message(
+                query.message, user.id, _sets_menu_text(draft_id), reply_markup=_sets_menu_markup(draft_id, page)
+            )
+        return
+    if action == "custom":
+        base.set_user_state(user.id, "adv8_set_size", {"draft_id": draft_id, "page": page})
+        with suppress(Exception):
+            await base.panel_show_message(
+                query.message,
+                user.id,
+                "<b>Set Builder</b>\n\nSend the number of questions per set (example: <code>24</code>).",
+            )
+        return
+    if action == "mk" and len(parts) >= 5:
+        per_set = _safe_int(parts[4])
+        if per_set <= 0:
+            return
+        chat_id = query.message.chat_id if query.message else user.id
+        await _deliver_sets(context, chat_id, user.id, draft_id, per_set)
+        with suppress(Exception):
+            text, kb = _build_draft_detail_text_markup(user.id, draft_id, page, "◆ Sets created.", context.bot_data.get("bot_username", ""))
+            await base.panel_show_message(query.message, user.id, text, reply_markup=kb)
+        return
+
+
+base.callback_router = _callback_router_v8
+
+
+_prev_handle_text_v8 = base.handle_text
+
+
+async def _handle_text_v8(update: Update, context) -> None:
+    message = update.effective_message
+    user = update.effective_user
+    chat = update.effective_chat
+    if not message or not user or not chat or not getattr(message, "text", None):
+        return await _prev_handle_text_v8(update, context)
+    state, payload = base.get_user_state(user.id)
+    if chat.type == "private" and state == "adv8_set_size":
+        raw = (message.text or "").strip()
+        draft_id = str(payload.get("draft_id") or "")
+        page = int(payload.get("page") or 0)
+        base.clear_user_state(user.id)
+        digits = re.sub(r"[^0-9]", "", raw)
+        per_set = int(digits) if digits else 0
+        if per_set <= 0:
+            await base.safe_reply(message, "▲️ Please send a valid positive number.")
+            return
+        await _deliver_sets(context, chat.id, user.id, draft_id, per_set)
+        with suppress(Exception):
+            text, kb = _build_draft_detail_text_markup(user.id, draft_id, page, "◆ Sets created.", context.bot_data.get("bot_username", ""))
+            await base.panel_show_message(message, user.id, text, reply_markup=kb)
+        return
+    return await _prev_handle_text_v8(update, context)
+
+
+base.handle_text = _handle_text_v8
+
+
+# ------------------------------------------------------------
+# 4) Manual-only, complete GitHub backup
+# ------------------------------------------------------------
+
+BACKUP_TABLES_V8 = [
+    "bot_admins",
+    "known_users",
+    "known_chats",
+    "drafts",
+    "draft_questions",
+    "draft_sections",
+    "active_drafts",
+    "group_bindings",
+    "user_visuals",
+    "practice_links",
+    "practice_attempts",
+    "sessions",
+    "session_questions",
+    "participants",
+    "answers",
+    "schedules",
+    "bot_settings",
+    "user_quiz_filters",
+    "admin_chat_access",
+]
+
+
+def _table_exists_v8(conn, table: str) -> bool:
+    row = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
+    return bool(row)
+
+
+def _table_columns_v8(conn, table: str) -> List[str]:
+    return [str(r[1]) for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+
+
+def export_backup_payload_v8() -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "version": 2,
+        "generated_at": base.now_ts(),
+        "brand_name": base.CONFIG.brand_name,
+        "tables": {},
+    }
+    with closing(base.DBH.connect()) as conn:
+        for table in BACKUP_TABLES_V8:
+            if not _table_exists_v8(conn, table):
+                continue
+            rows = conn.execute(f"SELECT * FROM {table}").fetchall()
+            payload["tables"][table] = [dict(r) for r in rows]
+    return payload
+
+
+def restore_state_from_github_v8() -> bool:
+    if not (base.GITHUB_TOKEN and base.GITHUB_REPO):
+        return False
+    raw = base._download_github_file_bytes(base.GITHUB_STATE_PATH)
+    if not raw:
+        return False
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except Exception as exc:
+        base.logger.warning("Invalid GitHub state backup: %s", exc)
+        return False
+    tables = payload.get("tables") if isinstance(payload, dict) else None
+    if not isinstance(tables, dict):
+        return False
+    restored = 0
+    with closing(base.DBH.connect()) as conn:
+        for table, rows in tables.items():
+            if not isinstance(rows, list) or not _table_exists_v8(conn, table):
+                continue
+            columns = _table_columns_v8(conn, table)
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                cols = [c for c in columns if c in row]
+                if not cols:
+                    continue
+                placeholders = ",".join("?" for _ in cols)
+                sql = f"INSERT OR REPLACE INTO {table}({','.join(cols)}) VALUES({placeholders})"
+                try:
+                    conn.execute(sql, tuple(row.get(c) for c in cols))
+                    restored += 1
+                except Exception:
+                    continue
+        conn.commit()
+    for row in tables.get("user_visuals", []) or []:
+        with suppress(Exception):
+            base.restore_thumbnail_file_from_github(int(row.get("user_id")), row.get("thumb_github_path"))
+    base.logger.info("GitHub restore complete: %s rows from %s", restored, base.GITHUB_STATE_PATH)
+    return restored > 0
+
+
+def _no_auto_backup(*_args, **_kwargs) -> None:
+    """Automatic backups are disabled — only the owner can trigger one."""
+    return None
+
+
+base.export_backup_payload = export_backup_payload_v8
+base.restore_state_from_github = restore_state_from_github_v8
+base.schedule_state_backup = _no_auto_backup
+
+
+# ------------------------------------------------------------
+# 5) Owner tools: rich status + rich-formatted backup reports
+# ------------------------------------------------------------
+
+async def cmd_richstatus(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    user = update.effective_user
+    if not message or not user or not base.is_owner(user.id):
+        return
+    md = "\n".join([
+        "# Rich Format Status",
+        "",
+        _md_table(
+            ["Item", "Value"],
+            [
+                ["Rich messages", rich_status()],
+                ["API_ID set", "yes" if (richfmt and richfmt.API_ID) else "no"],
+                ["API_HASH set", "yes" if (richfmt and richfmt.API_HASH) else "no"],
+                ["Auto backup", "disabled (manual only)"],
+                ["GitHub repo", base.GITHUB_REPO or "not configured"],
+                ["Backup path", base.GITHUB_STATE_PATH],
+            ],
+            ["l", "l"],
+            60,
+        ),
+        "",
+        "- [x] Rich results",
+        "- [x] Rich scoreboard",
+        "- [x] Set Builder",
+        f"- [{'x' if rich_available() else ' '}] Native rich delivery active",
+    ])
+    html_text = (
+        "<b>Rich Format Status</b>\n"
+        f"Rich messages: <b>{base.html_escape(rich_status())}</b>\n"
+        f"Auto backup: <b>disabled (manual only)</b>\n"
+        f"GitHub repo: <code>{base.html_escape(base.GITHUB_REPO or 'not configured')}</code>\n"
+        f"Backup path: <code>{base.html_escape(base.GITHUB_STATE_PATH)}</code>"
+    )
+    await send_rich_or_html(context, message.chat_id, md, html_text, plain="Rich status")
+
+
+_orig_build_app_v8 = base.build_app
+
+
+def _build_app_v8():
+    app = _orig_build_app_v8()
+    with suppress(Exception):
+        from telegram.ext import CommandHandler as _CH
+        app.add_handler(_CH(["richstatus", "richtest"], cmd_richstatus), group=3)
+    return app
+
+
+base.build_app = _build_app_v8
+
+
+
+
 if __name__ == "__main__":
     base.main()
