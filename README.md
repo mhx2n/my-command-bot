@@ -13,7 +13,14 @@ This package uses your uploaded bot as the base engine and adds an advanced over
 - admin / owner controls
 - file rename + thumbnail utilities
 
-## Added in this package
+## Added in this package (v8)
+- **Rich message formatting** everywhere (results, scoreboards, set reports) using Telegram's native rich markdown: headings, tables, quotes, task lists. Needs `API_ID` + `API_HASH` in the environment; if they are missing the bot automatically falls back to the old HTML messages.
+- **Result as a table** — personal result, section analysis and question breakdown are rendered as rich tables; group/admin scoreboard is a full rich table too.
+- **Manual-only GitHub backup** — automatic/debounced backups are turned off. Backups happen only when the owner runs `/backupnow`. The backup now covers every persistent table (users, chats, drafts, questions, sections, sessions, participants, answers, schedules, settings, practice links...), and it is restored automatically on every boot, so a restart or redeploy keeps everything exactly as it was.
+- **Set Builder** — in the draft edit panel, `❐ Set Builder` splits any draft (e.g. 213 CSV questions) into equal sets of 20/25/30/35/40/45/50/55/60/70 or a custom number. The remainder becomes the final set, and every set is created as its own exam with a serial-numbered practice link.
+- `/richstatus` — owner-only rich/backup diagnostics.
+
+## Previously added
 - `@QuizBot` guided clone workflow
 - text / TXT / JSON MCQ import with `✅` answer marking
 - smart cleanup of forwarded poll text
