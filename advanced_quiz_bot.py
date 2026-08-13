@@ -6815,7 +6815,10 @@ async def _finish_exam_with_rich_board(context, session_id: str, reason: str = "
             _ranking_markdown(session, ranking, limit=base.CONFIG.scoreboard_top_n),
             base.build_group_result_text(session, ranking, full=False)[:3800],
             plain="Final scoreboard",
+            reply_to=_session_start_message_id(session),
         )
+    _START_MSG_V8.pop(str(session_id), None)
+
 
 
 base.finish_exam = _finish_exam_with_rich_board
