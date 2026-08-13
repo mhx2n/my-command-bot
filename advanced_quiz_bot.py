@@ -5429,7 +5429,7 @@ def _latex_to_pretty_text(raw: str) -> str:
 
 
 def _html_from_display_text(raw: str) -> str:
-    return base.html_escape(_latex_to_pretty_text(raw)).replace('\n', '<br>')
+    return base.html_escape(_unicode_scripts_v18(_latex_to_pretty_text(raw))).replace('\n', '<br>')
 
 
 def _mathjax_html(raw: str) -> str:
