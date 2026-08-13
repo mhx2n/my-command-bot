@@ -7019,6 +7019,8 @@ _prev_build_draft_detail_v8 = _build_draft_detail_text_markup
 
 def _build_draft_detail_text_markup(user_id: int, draft_id: str, page: int = 0, header: str = "", bot_username: str = ""):  # type: ignore[no-redef]
     text, markup = _prev_build_draft_detail_v8(user_id, draft_id, page, header, bot_username)
+    if not _is_privileged(user_id):
+        return text, markup
     with suppress(Exception):
         rows = [list(r) for r in markup.inline_keyboard]
         rows.insert(
@@ -7027,6 +7029,7 @@ def _build_draft_detail_text_markup(user_id: int, draft_id: str, page: int = 0, 
         )
         markup = InlineKeyboardMarkup(rows)
     return text, markup
+
 
 
 _prev_callback_router_v8 = base.callback_router
