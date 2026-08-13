@@ -9442,7 +9442,17 @@ def _safe_negative_mark_v17(value: Any) -> float:
     return round(parsed, 4)
 
 
+_create_draft_before_v17 = base.create_draft
 _create_session_before_v17 = base.create_session_from_draft
+
+
+def _create_draft_v17(owner_id: int, title: str, question_time: int, negative_mark: float) -> str:
+    return _create_draft_before_v17(
+        owner_id,
+        title,
+        question_time,
+        _safe_negative_mark_v17(negative_mark),
+    )
 
 
 def _create_session_v17(draft_id: str, chat_id: int, actor_id: int) -> Optional[str]:
@@ -9458,6 +9468,7 @@ def _create_session_v17(draft_id: str, chat_id: int, actor_id: int) -> Optional[
     return _create_session_before_v17(draft_id, chat_id, actor_id)
 
 
+base.create_draft = _create_draft_v17
 base.create_session_from_draft = _create_session_v17
 
 
@@ -9542,6 +9553,14 @@ _build_app_before_v17 = base.build_app
 
 
 def _build_app_v17():
+    # Repair historical corrupt values restored from old backups before they
+    # can leak into cards, scoring, or newly-created sessions.
+    base.DBH.execute(
+        "UPDATE drafts SET negative_mark=0 WHERE negative_mark < 0 OR negative_mark > 1"
+    )
+    base.DBH.execute(
+        "UPDATE sessions SET negative_mark=0 WHERE negative_mark < 0 OR negative_mark > 1"
+    )
     app = _build_app_before_v17()
     from telegram.ext import CommandHandler as _CH17, PollAnswerHandler as _PAH17
 
