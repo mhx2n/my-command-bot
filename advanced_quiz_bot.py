@@ -6492,7 +6492,7 @@ def _start_card_markdown(session) -> str:
         ),
         "",
         "- [x] Answer each poll before its timer ends",
-        "- [x] Final result will arrive as a reply to this message",
+
         "",
         "---",
         f"_{_md(base.CONFIG.brand_name)}_",
