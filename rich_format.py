@@ -177,17 +177,17 @@ async def send_rich(
     reply_markup: Any = None,
     plain_fallback: str = "rich message",
     reply_to: Optional[int] = None,
-) -> bool:
-    """Send a native rich markdown message. Returns True on success."""
+) -> int:
+    """Send a native rich markdown message. Returns the message id (0 on failure)."""
     if not markdown or not markdown.strip():
-        return False
+        return 0
     client = await _get_client()
     if client is None:
-        return False
+        return 0
     try:
         peer = await _resolve_peer(client, chat_id)
         if peer is None:
-            return False
+            return 0
         kwargs: Dict[str, Any] = {
             "peer": peer,
             "message": plain_fallback[:200] or "rich message",
@@ -202,14 +202,34 @@ async def send_rich(
         if markup is not None:
             kwargs["reply_markup"] = markup
         try:
-            await client(functions.messages.SendMessageRequest(**kwargs))  # type: ignore[union-attr]
+            result = await client(functions.messages.SendMessageRequest(**kwargs))  # type: ignore[union-attr]
         except Exception:
             kwargs.pop("reply_to", None)
-            await client(functions.messages.SendMessageRequest(**kwargs))  # type: ignore[union-attr]
-        return True
+            result = await client(functions.messages.SendMessageRequest(**kwargs))  # type: ignore[union-attr]
+        return _extract_message_id(result)
     except Exception as exc:
         logger.info("Rich send failed for %s: %s", chat_id, exc)
-        return False
+        return 0
+
+
+def _extract_message_id(result: Any) -> int:
+    """Best-effort message id from a Telethon Updates object."""
+    try:
+        mid = getattr(result, "id", None)
+        if isinstance(mid, int) and mid > 0:
+            return mid
+        for upd in getattr(result, "updates", []) or []:
+            for attr in ("id", "message"):
+                val = getattr(upd, attr, None)
+                if isinstance(val, int) and val > 0:
+                    return val
+                inner = getattr(val, "id", None)
+                if isinstance(inner, int) and inner > 0:
+                    return inner
+    except Exception:
+        pass
+    return -1  # sent, but id unknown
+
 
 
 
