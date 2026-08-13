@@ -9258,9 +9258,19 @@ _DARK_THEME_IDS_V15 = {"midnight", "forest"}
 
 def _theme_readability_css_v15() -> str:
     parts: List[str] = [
-        "\n/* v15: fixed theme + professional readability */\n"
-        "#toggleThemeBtn{display:none!important}\n"
+        "\n/* Fixed owner theme with high-contrast light/dark modes. */\n"
         ".theme-row,.theme-picker{display:none!important}\n"
+        "body[data-theme='light']{--page-bg:#e8eef6!important;--text:#0b172a!important;"
+        "--muted:#40536a!important;--surface:#ffffff!important;--surface-2:#edf2f7!important;"
+        "--border:#b8c6d8!important;--glass:rgba(255,255,255,.94)!important;"
+        "--chip:rgba(15,118,110,.12)!important;--shadow:0 16px 40px rgba(15,23,42,.16)!important}\n"
+        "body[data-theme='dark']{--page-bg:#06101d!important;--text:#f1f7ff!important;"
+        "--muted:#a9bad0!important;--surface:#0d1a2c!important;--surface-2:#14243a!important;"
+        "--border:#344a66!important;--glass:rgba(6,16,29,.94)!important;"
+        "--chip:rgba(45,212,191,.13)!important;--shadow:0 18px 46px rgba(0,0,0,.46)!important}\n"
+        ".mode-toggle{position:fixed;left:14px;bottom:14px;z-index:120;height:52px;width:52px;"
+        "display:grid;place-items:center;border-radius:50%;border:1px solid var(--border);"
+        "background:var(--surface);color:var(--text);box-shadow:var(--shadow);font-size:22px;cursor:pointer}\n"
         ".q-index{color:var(--accent)!important;letter-spacing:.5px}\n"
         ".q-text,.opt-body,.review-q,.answer-line,.headline,.result-title,.stat .value,.timer-box .value"
         "{color:var(--text)!important}\n"
@@ -9270,7 +9280,7 @@ def _theme_readability_css_v15() -> str:
         ".opt{background:var(--surface-2)!important;color:var(--text)!important}\n"
         ".opt.selected{background:var(--accent-soft)!important;border-color:var(--accent)!important}\n"
         ".opt-label{color:var(--accent)!important}\n"
-        ".btn.primary,.fab.primary,.tab.active{background:var(--accent)!important;color:#ffffff!important}\n"
+        ".btn.primary,.fab.primary,.tab.active{background:var(--accent)!important;color:#ffffff!important;filter:saturate(1.25) contrast(1.08)}\n"
         ".btn.secondary{background:var(--surface-2)!important;color:var(--text)!important}\n"
         ".input,.input::placeholder{color:var(--text)}\n"
         ".input::placeholder{opacity:.62}\n"
@@ -9311,6 +9321,34 @@ def render_scroll_exam_html(draft: Any, owner_id: int) -> str:  # type: ignore[n
         '</div>',
         "",
     )
+    body_marker = "<body data-theme='"
+    body_at = html.find(body_marker)
+    if body_at >= 0:
+        body_end = html.find(">", body_at)
+        if body_end >= 0:
+            html = (
+                html[: body_end + 1]
+                + "<button id='globalThemeToggle' class='mode-toggle' type='button' aria-label='Toggle dark mode' title='Toggle dark mode'>◐</button>"
+                + html[body_end + 1 :]
+            )
+    mode_script = """
+<script>
+(function(){
+  const key='tqxColorMode';
+  let saved=''; try{saved=localStorage.getItem(key)||'';}catch(e){}
+  if(saved==='light'||saved==='dark'){
+    document.body.setAttribute('data-theme',saved);
+    document.documentElement.setAttribute('data-theme',saved);
+  }
+  const saveMode=()=>{try{localStorage.setItem(key,document.body.getAttribute('data-theme')||'dark');}catch(e){}};
+  const globalBtn=document.getElementById('globalThemeToggle');
+  if(globalBtn) globalBtn.onclick=()=>{toggleTheme();saveMode();};
+  const startBtn=document.getElementById('toggleThemeBtn');
+  if(startBtn) startBtn.addEventListener('click',saveMode);
+})();
+</script>
+"""
+    html = html.replace("</body>", mode_script + "</body>", 1)
     html = html.replace("</style>", _theme_readability_css_v15() + "</style>", 1)
     return html
 
@@ -9392,7 +9430,7 @@ async def _stop_exam_command_v16(update: Update, context: ContextTypes.DEFAULT_T
 
     session_id = str(session["id"])
     try:
-        async with base._operation_lock(context, f"stop-v16:{session_id}"):
+        async with base._operation_lock(context, f"private-exam:{session_id}"):
             current = base.get_session(session_id)
             if not current or str(current["status"]) in {"finished", "stopped"}:
                 await base.safe_reply(message, "This exam has already ended.")
@@ -9501,7 +9539,7 @@ async def _authoritative_poll_answer_v17(update: Update, context: ContextTypes.D
 
     should_advance = False
     try:
-        async with base._operation_lock(context, f"answer-v17:{session_id}:{qrow['q_no']}:{user.id}"):
+        async with base._operation_lock(context, f"private-exam:{session_id}"):
             session = base.get_session(session_id)
             if not session or str(session["status"]) != "running":
                 return
