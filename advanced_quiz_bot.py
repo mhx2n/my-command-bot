@@ -6043,7 +6043,9 @@ def owner_private_commands() -> List[BotCommand]:
         BotCommand("cleardefaultexplanation", "Clear default explanation"),
         BotCommand("exporttheme", "Set or list result themes"),
         BotCommand("backupnow", "Create a database backup"),
+        BotCommand("backups", "Backup vault: list, size, restore"),
         BotCommand("restorebackup", "Restore latest backup"),
+
         BotCommand("restart", "Restart bot"),
     ])
 
