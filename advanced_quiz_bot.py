@@ -8319,13 +8319,68 @@ def _share_card_html_v12(
     ]
     note = get_share_note_v13()
     if note:
-        body = base.html_escape(note)
+        body = _sanitize_note_html_v13(note)
         if practice_url:
             body = body.replace("{practice}", practice_url).replace("{link}", practice_url)
         if html_url:
             body = body.replace("{offline}", html_url).replace("{html}", html_url)
         lines.append(body)
     return "\n".join(lines)
+
+
+_NOTE_TAGS_V13 = ("b", "strong", "i", "em", "u", "ins", "s", "del", "code", "pre", "blockquote")
+
+
+def _sanitize_note_html_v13(note: str) -> str:
+    """Escape owner text but keep simple Telegram-safe formatting tags and links."""
+    body = base.html_escape(note)
+    for tag in _NOTE_TAGS_V13:
+        body = body.replace(f"&lt;{tag}&gt;", f"<{tag}>").replace(f"&lt;/{tag}&gt;", f"</{tag}>")
+    body = re.sub(
+        r'&lt;a href=(?:&quot;|")([^&"<>]+)(?:&quot;|")&gt;',
+        lambda m: f'<a href="{m.group(1)}">',
+        body,
+    )
+    body = body.replace("&lt;/a&gt;", "</a>")
+    return body
+
+
+async def cmd_sharenote_v13(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner/admin: set the text shown under the share card table."""
+    message = update.effective_message
+    user = update.effective_user
+    if not message or not user:
+        return
+    if not base.user_has_staff_access(user.id):
+        return
+    raw = (message.text or "")
+    parts = raw.split(None, 1)
+    body = parts[1].strip() if len(parts) > 1 else ""
+    if not body and message.reply_to_message:
+        body = (message.reply_to_message.text or message.reply_to_message.caption or "").strip()
+    if not body:
+        current = get_share_note_v13()
+        shown = base.html_escape(current) if current else "<i>(এখনো সেট করা হয়নি)</i>"
+        await message.reply_text(
+            "📝 <b>Share card note</b>\n\n"
+            f"{shown}\n\n"
+            "সেট করতে:\n<code>/sharenote আপনার লেখা\nএকাধিক লাইনও দিতে পারবেন</code>\n"
+            "মুছতে: <code>/sharenote off</code>\n\n"
+            "প্লেসহোল্ডার: <code>{practice}</code> · <code>{offline}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    if body.strip().lower() in {"off", "clear", "reset", "none"}:
+        set_setting(_SHARE_NOTE_KEY_V13, "")
+        await message.reply_text("🧹 Share card note মুছে ফেলা হয়েছে।")
+        return
+    set_setting(_SHARE_NOTE_KEY_V13, body)
+    await message.reply_text(
+        "✅ Share card note সেট হয়েছে:\n\n" + _sanitize_note_html_v13(body),
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
+
 
 
 
