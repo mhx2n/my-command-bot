@@ -5793,9 +5793,12 @@ def render_user_result_html(session: Any, participant_row: Any, rank_item: Dict[
         )
     tpl = """<!DOCTYPE html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><title>__TITLE__ — Result</title><link rel='preconnect' href='https://fonts.googleapis.com'><link rel='preconnect' href='https://fonts.gstatic.com' crossorigin><link href='https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=Noto+Sans+Bengali:wght@400;500;600;700;800;900&display=swap' rel='stylesheet'><style>
 *,*::before,*::after{box-sizing:border-box}
-:root{--accent:__ACCENT__;--success:__SUCCESS__;--danger:__DANGER__;--warning:__WARNING__;--bg:__LIGHT_BG__;--text:__LIGHT_TEXT__;--muted:__LIGHT_MUTED__;--surface:__LIGHT_CARD__;--border:__LIGHT_BORDER__;--soft:#f8fafc;--radius:20px;--shadow:0 10px 30px rgba(15,23,42,.08)}
+:root{--accent:__ACCENT__;--success:__SUCCESS__;--danger:__DANGER__;--warning:__WARNING__;--radius:20px}
+body[data-theme='light']{--bg:#e8eef6;--text:#0b172a;--muted:#40536a;--surface:#ffffff;--border:#b8c6d8;--soft:#edf2f7;--shadow:0 14px 36px rgba(15,23,42,.15)}
+body[data-theme='dark']{--bg:__DARK_BG__;--text:__DARK_TEXT__;--muted:__DARK_MUTED__;--surface:__DARK_SURFACE__;--border:__DARK_BORDER__;--soft:__DARK_SURFACE_2__;--shadow:0 18px 46px rgba(0,0,0,.45)}
 html,body{margin:0;padding:0}
-body{font-family:'Inter','Noto Sans Bengali',system-ui,-apple-system,'Segoe UI',Roboto,Arial,sans-serif;background:linear-gradient(180deg,#eef2ff 0%,var(--bg) 240px);color:var(--text);line-height:1.6;-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
+body{font-family:'Inter','Noto Sans Bengali',system-ui,-apple-system,'Segoe UI',Roboto,Arial,sans-serif;background:var(--bg);color:var(--text);line-height:1.6;-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility;transition:background .2s,color .2s}
+.mode-toggle{position:fixed;right:14px;bottom:14px;z-index:20;width:52px;height:52px;border-radius:50%;border:1px solid var(--border);background:var(--surface);color:var(--text);box-shadow:var(--shadow);font-size:22px;cursor:pointer}
 .shell{width:100%;max-width:1140px;margin:0 auto;padding:24px 16px 48px;display:flex;flex-direction:column;gap:18px}
 .card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--shadow);overflow:hidden}
 .hero{padding:28px}
@@ -5804,9 +5807,9 @@ body{font-family:'Inter','Noto Sans Bengali',system-ui,-apple-system,'Segoe UI',
 .section-h{font-size:clamp(18px,2.4vw,22px);font-weight:800;margin:0 0 14px;letter-spacing:-.01em}
 .summary{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-top:20px}
 .stat{padding:16px;border-radius:16px;background:var(--soft);border:1px solid var(--border);min-width:0}
-.stat.ok{background:rgba(22,101,52,.10);border-color:rgba(22,101,52,.35)}
-.stat.bad{background:rgba(190,18,60,.10);border-color:rgba(190,18,60,.35)}
-.stat.warn{background:rgba(202,138,4,.12);border-color:rgba(202,138,4,.35)}
+.stat.ok{background:color-mix(in srgb,var(--success) 18%,var(--soft));border-color:var(--success)}
+.stat.bad{background:color-mix(in srgb,var(--danger) 18%,var(--soft));border-color:var(--danger)}
+.stat.warn{background:color-mix(in srgb,var(--warning) 18%,var(--soft));border-color:var(--warning)}
 .label{font-size:12px;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:.06em}
 .value{font-size:clamp(22px,3vw,30px);font-weight:900;margin-top:6px;letter-spacing:-.02em;word-break:break-word}
 .two{display:grid;grid-template-columns:1.1fr .9fr;gap:18px}
@@ -5835,7 +5838,7 @@ img,svg{max-width:100%;height:auto}
 @media(max-width:900px){.two{grid-template-columns:1fr}}
 @media(max-width:560px){.shell{padding:14px 12px 32px;gap:14px}.hero,.panel{padding:18px}.summary{grid-template-columns:repeat(2,1fr);gap:10px}.stat{padding:12px;border-radius:12px}.value{font-size:20px}.label{font-size:11px}.review-card{padding:14px}.review-q{font-size:15px}.table th,.table td{padding:10px 10px}}
 @media print{body{background:#fff}.card{box-shadow:none;border-color:#e5e7eb}}
-</style><script>window.MathJax={tex:{inlineMath:[["\\\\(","\\\\)"],["$","$"]],displayMath:[["\\\\[","\\\\]"],["$$","$$"]]},svg:{fontCache:'global'}};</script><script defer src='https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js'></script></head><body><div class='shell'><div class='card hero'><h1 class='title'>__TITLE__</h1><div class='name'>Professional result report for __NAME__</div><div class='summary'>__SUMMARY__</div></div><div class='two'><div class='card panel'><div class='section-h'>Ranking Board</div><div class='table-wrap'><table class='table'><thead><tr><th>#</th><th>Name</th><th>Correct</th><th>Wrong</th><th>Skipped</th><th>Score</th></tr></thead><tbody>__TOP_ROWS__</tbody></table></div></div><div class='card panel'><div class='section-h'>Section Analysis</div><div class='grid'>__SECTION_CARDS__</div></div></div><div class='card panel'><div class='section-h'>Detailed Review</div><div class='reviews'>__REVIEWS__</div></div></div></body></html>"""
+</style><script>window.MathJax={tex:{inlineMath:[["\\\\(","\\\\)"],["$","$"]],displayMath:[["\\\\[","\\\\]"],["$$","$$"]]},svg:{fontCache:'global'}};</script><script defer src='https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js'></script></head><body data-theme='dark'><button id='resultThemeToggle' class='mode-toggle' type='button' aria-label='Toggle dark mode' title='Toggle dark mode'>◐</button><div class='shell'><div class='card hero'><h1 class='title'>__TITLE__</h1><div class='name'>Professional result report for __NAME__</div><div class='summary'>__SUMMARY__</div></div><div class='two'><div class='card panel'><div class='section-h'>Ranking Board</div><div class='table-wrap'><table class='table'><thead><tr><th>#</th><th>Name</th><th>Correct</th><th>Wrong</th><th>Skipped</th><th>Score</th></tr></thead><tbody>__TOP_ROWS__</tbody></table></div></div><div class='card panel'><div class='section-h'>Section Analysis</div><div class='grid'>__SECTION_CARDS__</div></div></div><div class='card panel'><div class='section-h'>Detailed Review</div><div class='reviews'>__REVIEWS__</div></div></div><script>(function(){const key='tqxResultColorMode';let mode='dark';try{mode=localStorage.getItem(key)||'dark'}catch(e){}if(mode!=='light'&&mode!=='dark')mode='dark';document.body.dataset.theme=mode;document.getElementById('resultThemeToggle').onclick=()=>{mode=document.body.dataset.theme==='dark'?'light':'dark';document.body.dataset.theme=mode;try{localStorage.setItem(key,mode)}catch(e){}}})();</script></body></html>"""
     return (tpl.replace('__TITLE__', title)
               .replace('__NAME__', name)
               .replace('__SUMMARY__', summary_html)
@@ -5850,7 +5853,13 @@ img,svg{max-width:100%;height:auto}
               .replace('__LIGHT_TEXT__', theme['light_text'])
               .replace('__LIGHT_CARD__', theme['light_card'])
               .replace('__LIGHT_BORDER__', theme['light_border'])
-              .replace('__LIGHT_MUTED__', theme['light_muted']))
+               .replace('__LIGHT_MUTED__', theme['light_muted'])
+               .replace('__DARK_BG__', theme['dark_bg'])
+               .replace('__DARK_TEXT__', theme['dark_text'])
+               .replace('__DARK_MUTED__', theme['dark_muted'])
+               .replace('__DARK_SURFACE__', theme['dark_surface'])
+               .replace('__DARK_SURFACE_2__', theme['dark_surface_2'])
+               .replace('__DARK_BORDER__', theme['dark_border']))
 
 # ============================================================
 # Final patches: friendlier name fallback, scoped commands honour
