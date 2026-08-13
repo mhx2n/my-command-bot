@@ -7873,6 +7873,8 @@ def _build_app_v9():
 
 
 
+base.build_app = _build_app_v9
+
 
 # ============================================================
 # Patch v10 — single exam-start card + inline reverse countdown
