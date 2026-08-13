@@ -1391,23 +1391,34 @@ def create_session_from_draft(draft_id: str, chat_id: int, actor_id: int) -> Opt
         return None
     session_id = short_uuid() + short_uuid()
     started = now_ts()
-    DBH.execute(
-        "INSERT INTO sessions(id, chat_id, draft_id, title, question_time, negative_mark, total_questions, current_index, status, started_at, created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-        (
-            session_id,
-            chat_id,
-            draft_id,
-            draft["title"],
-            draft["question_time"],
-            draft["negative_mark"],
-            len(questions),
-            0,
-            "countdown",
-            started,
-            actor_id,
-        ),
-    )
     with closing(DBH.connect()) as conn:
+        # The UI checks for an active session before calling this function, but
+        # two callbacks can pass that check concurrently. Serialize creation in
+        # SQLite so one chat can never own overlapping live sessions.
+        conn.execute("BEGIN IMMEDIATE")
+        existing = conn.execute(
+            "SELECT id FROM sessions WHERE chat_id=? AND status IN ('countdown','running','paused') LIMIT 1",
+            (chat_id,),
+        ).fetchone()
+        if existing:
+            conn.rollback()
+            return None
+        conn.execute(
+            "INSERT INTO sessions(id, chat_id, draft_id, title, question_time, negative_mark, total_questions, current_index, status, started_at, created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                session_id,
+                chat_id,
+                draft_id,
+                draft["title"],
+                draft["question_time"],
+                draft["negative_mark"],
+                len(questions),
+                0,
+                "countdown",
+                started,
+                actor_id,
+            ),
+        )
         for q in questions:
             conn.execute(
                 "INSERT INTO session_questions(session_id, q_no, question, options, correct_option, explanation) VALUES(?,?,?,?,?,?)",

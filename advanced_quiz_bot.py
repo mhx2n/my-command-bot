@@ -9461,8 +9461,9 @@ async def _stop_exam_command_v16(update: Update, context: ContextTypes.DEFAULT_T
 
     target_chat_id = int(user.id) if chat.type == "private" else int(chat.id)
     session = base.DBH.fetchone(
-        "SELECT * FROM sessions WHERE chat_id=? AND status IN ('countdown','running','paused') "
-        "ORDER BY started_at DESC LIMIT 1",
+        "SELECT s.* FROM sessions s WHERE s.chat_id=? AND s.status IN ('countdown','running','paused') "
+        "ORDER BY EXISTS(SELECT 1 FROM answers a WHERE a.session_id=s.id) DESC, "
+        "(s.active_poll_id IS NOT NULL) DESC, s.started_at DESC, s.id DESC LIMIT 1",
         (target_chat_id,),
     )
     if not session:
