@@ -4449,7 +4449,7 @@ def _latex_to_poll_text(raw: str) -> str:
 
 
 def _html_from_display_text(raw: str) -> str:
-    return base.html_escape(_latex_to_pretty_text(raw)).replace('\n', '<br>')
+    return base.html_escape(_unicode_scripts_v18(_latex_to_pretty_text(raw))).replace('\n', '<br>')
 
 
 def _png_data_uri(blob: Optional[bytes]) -> str:
@@ -5429,7 +5429,7 @@ def _latex_to_pretty_text(raw: str) -> str:
 
 
 def _html_from_display_text(raw: str) -> str:
-    return base.html_escape(_latex_to_pretty_text(raw)).replace('\n', '<br>')
+    return base.html_escape(_unicode_scripts_v18(_latex_to_pretty_text(raw))).replace('\n', '<br>')
 
 
 def _mathjax_html(raw: str) -> str:
@@ -5437,6 +5437,41 @@ def _mathjax_html(raw: str) -> str:
     if not value:
         return ''
     return base.html_escape(base.normalize_visual_text(value)).replace('\n', '<br>')
+
+
+_SUPERSCRIPT_V18 = str.maketrans("0123456789+-=()n", "⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁼⁽⁾ⁿ")
+_SUBSCRIPT_V18 = str.maketrans("0123456789+-=()", "₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎")
+
+
+def _unicode_scripts_v18(text: str) -> str:
+    """Render common mixed Bangla/Latin powers without sending prose to MathJax."""
+    value = str(text or "")
+
+    def super_group(match: re.Match[str]) -> str:
+        raw = match.group(1)
+        converted = raw.translate(_SUPERSCRIPT_V18)
+        return converted if len(converted) == len(raw) else "^(" + raw + ")"
+
+    def sub_group(match: re.Match[str]) -> str:
+        raw = match.group(1)
+        converted = raw.translate(_SUBSCRIPT_V18)
+        return converted if len(converted) == len(raw) else "_(" + raw + ")"
+
+    value = re.sub(r"\^\(([-+0-9=n]+)\)", super_group, value)
+    value = re.sub(r"\^\{([-+0-9=n]+)\}", super_group, value)
+    value = re.sub(r"\^([-+0-9n])", super_group, value)
+    value = re.sub(r"_\(([-+0-9=]+)\)", sub_group, value)
+    value = re.sub(r"_\{([-+0-9=]+)\}", sub_group, value)
+    value = re.sub(r"_([-+0-9])", sub_group, value)
+    # Common imported scientific notation uses a Unicode minus without a
+    # caret (for example 10−4).  Preserve normal prose numbers, but promote it
+    # when it directly follows a power-of-ten base or a physical unit.
+    value = re.sub(
+        r"\b(10|cm|mm|km|ms|m|s)\s*[−-]([0-9]{1,2})\b",
+        lambda m: m.group(1) + ("-" + m.group(2)).translate(_SUPERSCRIPT_V18),
+        value,
+    )
+    return value
 
 
 def _contains_math_markup(text: str) -> bool:
@@ -9426,8 +9461,9 @@ async def _stop_exam_command_v16(update: Update, context: ContextTypes.DEFAULT_T
 
     target_chat_id = int(user.id) if chat.type == "private" else int(chat.id)
     session = base.DBH.fetchone(
-        "SELECT * FROM sessions WHERE chat_id=? AND status IN ('countdown','running','paused') "
-        "ORDER BY started_at DESC LIMIT 1",
+        "SELECT s.* FROM sessions s WHERE s.chat_id=? AND s.status IN ('countdown','running','paused') "
+        "ORDER BY EXISTS(SELECT 1 FROM answers a WHERE a.session_id=s.id) DESC, "
+        "(s.active_poll_id IS NOT NULL) DESC, s.started_at DESC, s.id DESC LIMIT 1",
         (target_chat_id,),
     )
     if not session:
@@ -9441,7 +9477,13 @@ async def _stop_exam_command_v16(update: Update, context: ContextTypes.DEFAULT_T
 
     session_id = str(session["id"])
     try:
-        async with base._operation_lock(context, f"private-exam:{session_id}"):
+        # Telegram can deliver PollAnswer just after the command update. Wait
+        # before taking the shared lock so an in-flight answer can commit.
+        await asyncio.sleep(0.35)
+        # Poll answers and stop/finalize must share one lock. Previously the
+        # stop command could mark the session finished while Telegram's answer
+        # update was committing, producing a zero-participant scoreboard.
+        async with base._operation_lock(context, f"exam-answer:{session_id}"):
             current = base.get_session(session_id)
             if not current or str(current["status"]) in {"finished", "stopped"}:
                 await base.safe_reply(message, "This exam has already ended.")
@@ -9682,16 +9724,26 @@ async def _authoritative_poll_answer_v17(update: Update, context: ContextTypes.D
                     name = str(job.name or "")
                     if name.startswith(f"close:{session_id}:") or name.startswith(f"advance:{session_id}:"):
                         job.schedule_removal()
-                try:
-                    await context.bot.stop_poll(
-                        chat_id=int(session["chat_id"]),
-                        message_id=int(qrow["message_id"]),
-                    )
-                except Exception as exc:
-                    base.logger.info("Could not close answered inbox poll %s: %s", answer.poll_id, exc)
+                old_message_id = int(qrow["message_id"] or 0)
                 base.set_session_active_poll(session_id, None, None)
-                await asyncio.sleep(0.15)
+                # Do not block next-question delivery on Telegram's stopPoll
+                # round trip. The DB is authoritative; close the old visual
+                # poll in the background after the next one is queued.
                 await base.begin_or_advance_exam(context, session_id)
+                if old_message_id:
+                    async def _close_old_poll() -> None:
+                        try:
+                            await context.bot.stop_poll(
+                                chat_id=int(session["chat_id"]),
+                                message_id=old_message_id,
+                            )
+                        except Exception as exc:
+                            base.logger.info("Could not close answered inbox poll %s: %s", answer.poll_id, exc)
+
+                    context.application.create_task(
+                        _close_old_poll(),
+                        name=f"close-answered:{session_id}:{qrow['q_no']}",
+                    )
             elif inserted:
                 base.logger.info(
                     "Recorded group participant: session=%s user=%s q=%s",

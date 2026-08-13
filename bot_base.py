@@ -1391,23 +1391,34 @@ def create_session_from_draft(draft_id: str, chat_id: int, actor_id: int) -> Opt
         return None
     session_id = short_uuid() + short_uuid()
     started = now_ts()
-    DBH.execute(
-        "INSERT INTO sessions(id, chat_id, draft_id, title, question_time, negative_mark, total_questions, current_index, status, started_at, created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-        (
-            session_id,
-            chat_id,
-            draft_id,
-            draft["title"],
-            draft["question_time"],
-            draft["negative_mark"],
-            len(questions),
-            0,
-            "countdown",
-            started,
-            actor_id,
-        ),
-    )
     with closing(DBH.connect()) as conn:
+        # The UI checks for an active session before calling this function, but
+        # two callbacks can pass that check concurrently. Serialize creation in
+        # SQLite so one chat can never own overlapping live sessions.
+        conn.execute("BEGIN IMMEDIATE")
+        existing = conn.execute(
+            "SELECT id FROM sessions WHERE chat_id=? AND status IN ('countdown','running','paused') LIMIT 1",
+            (chat_id,),
+        ).fetchone()
+        if existing:
+            conn.rollback()
+            return None
+        conn.execute(
+            "INSERT INTO sessions(id, chat_id, draft_id, title, question_time, negative_mark, total_questions, current_index, status, started_at, created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                session_id,
+                chat_id,
+                draft_id,
+                draft["title"],
+                draft["question_time"],
+                draft["negative_mark"],
+                len(questions),
+                0,
+                "countdown",
+                started,
+                actor_id,
+            ),
+        )
         for q in questions:
             conn.execute(
                 "INSERT INTO session_questions(session_id, q_no, question, options, correct_option, explanation) VALUES(?,?,?,?,?,?)",
@@ -1731,15 +1742,23 @@ async def begin_or_advance_exam(context: ContextTypes.DEFAULT_TYPE, session_id: 
 async def close_poll_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     session_id = context.job.data["session_id"]
     q_no = context.job.data["q_no"]
-    session = get_session(session_id)
-    if not session or session["status"] != "running":
-        return
-    q = get_session_question(session_id, q_no)
-    if not q:
-        return
-    # Poll already auto-closes because send_poll uses open_period.
-    set_session_active_poll(session_id, None, None)
-    context.job_queue.run_once(begin_or_advance_exam_job, when=0.8, data={"session_id": session_id}, name=f"advance:{session_id}")
+    # Telegram's PollAnswer delivery can trail the visible poll close slightly.
+    # This grace period lets the last accepted group vote enter the shared lock
+    # before the question/session advances.
+    await asyncio.sleep(0.45)
+    # Serialize timeout advancement with answer recording. At the timer edge a
+    # PollAnswer and this job can arrive concurrently; advancing first used to
+    # make that valid group vote unmappable or "not running" at finalization.
+    async with _operation_lock(context, f"exam-answer:{session_id}"):
+        session = get_session(session_id)
+        if not session or session["status"] != "running":
+            return
+        q = get_session_question(session_id, q_no)
+        if not q or int(session["current_index"] or 0) != int(q_no):
+            return
+        # Poll already auto-closes because send_poll uses open_period.
+        set_session_active_poll(session_id, None, None)
+        await begin_or_advance_exam(context, session_id)
 
 
 async def finish_exam(context: ContextTypes.DEFAULT_TYPE, session_id: str, reason: str = "completed") -> None:
