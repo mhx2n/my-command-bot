@@ -2683,7 +2683,8 @@ def _smart_clean_question_text(raw: str) -> str:
     value = _strip_question_brand_prefix(original)
     value = re.sub(r"/view_[A-Za-z0-9_]+", " ", value)
     value = COUNTER_RE.sub("", value)
-    value = re.sub(r"\[[^\]]{0,120}?@[^\]]+\]", " ", value)
+    # Only a pure @mention bracket is removed; every other [ ... ] stays intact.
+    value = re.sub(r"\[\s*@[A-Za-z0-9_]{3,}\s*\]", " ", value)
     value = re.sub(r"\bvia\b\s+@?[A-Za-z0-9_]+", " ", value, flags=re.I)
     value = URL_RE.sub(" ", value)
     value = USERNAME_RE.sub(" ", value)
