@@ -8713,6 +8713,7 @@ async def finish_exam(context: ContextTypes.DEFAULT_TYPE, session_id: str, reaso
 
         ranking = get_session_ranking(session_id)
 
+        delivery_ok = True
         if not is_private_exam:
             try:
                 text = build_group_result_text(session, ranking)
@@ -8724,23 +8725,27 @@ async def finish_exam(context: ContextTypes.DEFAULT_TYPE, session_id: str, reaso
                 )
             except Exception as exc:
                 logger.warning("Could not send text leaderboard for %s: %s", session_id, exc)
+                delivery_ok = False
 
         try:
             await send_private_results(context, session_id)
         except Exception:
             logger.exception("Failed to send private results for %s", session_id)
+            delivery_ok = False
 
         if not is_private_exam:
             try:
                 await send_admin_text_results(context, session, ranking)
             except Exception:
                 logger.exception("Failed to send admin text summary for %s", session_id)
+                delivery_ok = False
 
         if not is_private_exam:
             try:
                 await send_admin_pdf_report(context, session_id, ranking)
             except Exception:
                 logger.exception("Failed to send admin PDF report for %s", session_id)
+                delivery_ok = False
 
         if not is_private_exam:
             DBH.execute("DELETE FROM group_bindings WHERE chat_id=?", (chat_id,))
@@ -8757,7 +8762,8 @@ async def finish_exam(context: ContextTypes.DEFAULT_TYPE, session_id: str, reaso
             "participants": len(ranking),
             "draft_preserved": True,
         })
-        finish_done_store[session_id] = now_ts()
+        if delivery_ok:
+            finish_done_store[session_id] = now_ts()
 
 # __main__ moved to end so runtime patches below are loaded before startup.
 
