@@ -176,30 +176,61 @@ async def send_rich(
     markdown: str,
     reply_markup: Any = None,
     plain_fallback: str = "rich message",
-) -> bool:
-    """Send a native rich markdown message. Returns True on success."""
+    reply_to: Optional[int] = None,
+) -> int:
+    """Send a native rich markdown message. Returns the message id (0 on failure)."""
     if not markdown or not markdown.strip():
-        return False
+        return 0
     client = await _get_client()
     if client is None:
-        return False
+        return 0
     try:
         peer = await _resolve_peer(client, chat_id)
         if peer is None:
-            return False
+            return 0
         kwargs: Dict[str, Any] = {
             "peer": peer,
             "message": plain_fallback[:200] or "rich message",
             "rich_message": types.InputRichMessageMarkdown(markdown=markdown),  # type: ignore[union-attr]
         }
+        if reply_to:
+            try:
+                kwargs["reply_to"] = types.InputReplyToMessage(reply_to_msg_id=int(reply_to))  # type: ignore[union-attr]
+            except Exception:
+                pass
         markup = _convert_markup(reply_markup)
         if markup is not None:
             kwargs["reply_markup"] = markup
-        await client(functions.messages.SendMessageRequest(**kwargs))  # type: ignore[union-attr]
-        return True
+        try:
+            result = await client(functions.messages.SendMessageRequest(**kwargs))  # type: ignore[union-attr]
+        except Exception:
+            kwargs.pop("reply_to", None)
+            result = await client(functions.messages.SendMessageRequest(**kwargs))  # type: ignore[union-attr]
+        return _extract_message_id(result)
     except Exception as exc:
         logger.info("Rich send failed for %s: %s", chat_id, exc)
-        return False
+        return 0
+
+
+def _extract_message_id(result: Any) -> int:
+    """Best-effort message id from a Telethon Updates object."""
+    try:
+        mid = getattr(result, "id", None)
+        if isinstance(mid, int) and mid > 0:
+            return mid
+        for upd in getattr(result, "updates", []) or []:
+            for attr in ("id", "message"):
+                val = getattr(upd, attr, None)
+                if isinstance(val, int) and val > 0:
+                    return val
+                inner = getattr(val, "id", None)
+                if isinstance(inner, int) and inner > 0:
+                    return inner
+    except Exception:
+        pass
+    return -1  # sent, but id unknown
+
+
 
 
 # ------------------------------------------------------------
@@ -218,8 +249,21 @@ def md_escape(text: Any) -> str:
     return s
 
 
+class MDRaw(str):
+    """Marker for text that already contains valid markdown (links, bold…)."""
+
+
+def md_link(label: Any, url: Optional[str]) -> MDRaw:
+    text = md_cell(label, 80)
+    if not url:
+        return MDRaw(text)
+    return MDRaw(f"[{text}]({url})")
+
+
 def md_cell(text: Any, limit: int = 60) -> str:
     """Escape and flatten a value so it is safe inside a markdown table cell."""
+    if isinstance(text, MDRaw):
+        return re.sub(r"\s+", " ", str(text)).strip().replace("|", "\\|") or "—"
     s = str(text if text is not None else "")
     s = re.sub(r"\s+", " ", s).strip()
     if len(s) > limit:
@@ -228,6 +272,7 @@ def md_cell(text: Any, limit: int = 60) -> str:
     for ch in "`*_[]":
         s = s.replace(ch, "\\" + ch)
     return s or "—"
+
 
 
 def md_table(

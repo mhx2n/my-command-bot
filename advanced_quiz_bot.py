@@ -6394,40 +6394,142 @@ async def send_rich_or_html(
     html_text: str,
     reply_markup=None,
     plain: str = "",
-) -> bool:
-    """Try to deliver a native rich message; fall back to normal HTML."""
+    reply_to: Optional[int] = None,
+) -> int:
+    """Try to deliver a native rich message; fall back to normal HTML.
+
+    Returns the sent message id (or -1 when sent but the id is unknown, 0 on failure).
+    """
     if rich_available():
         try:
-            ok = await richfmt.send_rich(
+            mid = await richfmt.send_rich(
                 chat_id,
                 markdown,
                 reply_markup=reply_markup,
                 plain_fallback=plain or "result",
+                reply_to=reply_to,
             )
-            if ok:
-                return True
+            if mid:
+                return int(mid)
         except Exception:
             pass
-    with suppress(TelegramError, Exception):
-        await context.bot.send_message(
+    try:
+        sent = await context.bot.send_message(
             chat_id,
             html_text,
             parse_mode=ParseMode.HTML,
             reply_markup=reply_markup,
             disable_web_page_preview=True,
+            reply_to_message_id=reply_to or None,
         )
-        return True
-    return False
+        return int(getattr(sent, "message_id", -1) or -1)
+    except Exception:
+        with suppress(TelegramError, Exception):
+            sent = await context.bot.send_message(
+                chat_id,
+                html_text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=reply_markup,
+                disable_web_page_preview=True,
+            )
+            return int(getattr(sent, "message_id", -1) or -1)
+    return 0
 
 
 def _md(text: Any) -> str:
     return richfmt.md_escape(text) if richfmt else str(text)
 
 
+def _md_link(label: Any, url: Optional[str]):
+    if not richfmt:
+        return str(label)
+    return richfmt.md_link(label, url)
+
+
 def _md_table(headers, rows, aligns=None, cell_limit: int = 60) -> str:
     if not richfmt:
         return ""
     return richfmt.md_table(headers, rows, aligns, cell_limit)
+
+
+# ------------------------------------------------------------
+# Exam start card + result reply tracking
+# ------------------------------------------------------------
+
+_START_MSG_V8: Dict[str, int] = {}
+
+
+def _session_start_message_id(session) -> Optional[int]:
+    sid = str(base._row_value(session, "id", "") or "")
+    mid = _START_MSG_V8.get(sid)
+    if not mid:
+        with suppress(Exception):
+            mid = int(base._row_value(session, "status_message_id", 0) or 0)
+    return mid if mid and mid > 0 else None
+
+
+def _start_card_markdown(session) -> str:
+    title = str(base._row_value(session, "title", "Exam"))
+    return "\n".join([
+        f"# {title}",
+        "",
+        "## Exam Started",
+        "",
+        _md_table(
+            ["Item", "Value"],
+            [
+                ["Questions", base._row_value(session, "total_questions", 0)],
+                ["Time / question", f'{base._row_value(session, "question_time", 0)} sec'],
+                ["Negative / wrong", base._row_value(session, "negative_mark", 0)],
+                ["Status", "Running now"],
+            ],
+            ["l", "r"],
+        ),
+        "",
+        "- [x] Answer each poll before its timer ends",
+        "- [ ] Final result will arrive as a reply to this message",
+        "",
+        "---",
+        f"_{_md(base.CONFIG.brand_name)}_",
+    ])
+
+
+def _start_card_html(session) -> str:
+    return "\n".join([
+        f'<b>{base.html_escape(str(base._row_value(session, "title", "Exam")))}</b>',
+        "",
+        f'Questions: <b>{base._row_value(session, "total_questions", 0)}</b>',
+        f'Time / question: <b>{base._row_value(session, "question_time", 0)} sec</b>',
+        f'Negative / wrong: <b>{base._row_value(session, "negative_mark", 0)}</b>',
+        "",
+        "<b>Exam is running now.</b>",
+    ])
+
+
+_prev_start_countdown_v8 = base.start_exam_countdown
+
+
+async def _start_exam_countdown_v8(context, session_id: str, existing_message_id=None) -> None:
+    await _prev_start_countdown_v8(context, session_id, existing_message_id)
+    with suppress(Exception):
+        session = base.get_session(session_id)
+        if not session or str(session["status"]) != "running":
+            return
+        mid = await send_rich_or_html(
+            context,
+            int(session["chat_id"]),
+            _start_card_markdown(session),
+            _start_card_html(session),
+            plain=f'{session["title"]} — exam started',
+        )
+        if mid and mid > 0:
+            _START_MSG_V8[str(session_id)] = int(mid)
+            with suppress(Exception):
+                base.DBH.execute("UPDATE sessions SET status_message_id=? WHERE id=?", (int(mid), session_id))
+
+
+base.start_exam_countdown = _start_exam_countdown_v8
+
 
 
 # ------------------------------------------------------------
@@ -6477,20 +6579,25 @@ def _build_rich_result_markdown(session, rank_item, section_data, buckets_plain,
     parts.append("")
     parts.append(
         _md_table(
-            ["Status", "Questions"],
+            ["Status", "Count"],
             [
-                ["Correct", buckets_plain["correct"] or "—"],
-                ["Wrong", buckets_plain["wrong"] or "—"],
-                ["Skipped", buckets_plain["skipped"] or "—"],
+                ["✔ Correct", meta["correct"]],
+                ["✘ Wrong", meta["wrong"]],
+                ["– Skipped", meta["skipped"]],
             ],
-            ["l", "l"],
-            220,
+            ["l", "r"],
         )
     )
     parts.append("")
+    for key, label in (("correct", "✔ Correct questions"), ("wrong", "✘ Wrong questions"), ("skipped", "– Skipped questions")):
+        parts.append(f"**{label}**")
+        parts.append("")
+        parts.append(buckets_plain.get(key) or "—")
+        parts.append("")
     parts.append("---")
     parts.append(f"_{_md(base.CONFIG.brand_name)}_")
     return "\n".join(parts)
+
 
 
 async def send_private_results(context, session_id: str) -> None:  # type: ignore[no-redef]
@@ -6529,13 +6636,18 @@ async def send_private_results(context, session_id: str) -> None:  # type: ignor
                 (session_id, item["q_no"]),
             )
             link = None
+            msg_id = 0
             with suppress(Exception):
-                link = base.get_message_link(int(session["chat_id"]), int(qrow["message_id"] or 0), username) if qrow else None
+                msg_id = int(qrow["message_id"] or 0) if qrow else 0
+            if msg_id > 0:
+                with suppress(Exception):
+                    link = base.get_message_link(int(session["chat_id"]), msg_id, username)
             label = f'<a href="{link}">Q{item["q_no"]}</a>' if link else f'Q{item["q_no"]}'
             buckets_html[item["status"]].append(label)
             buckets_plain[item["status"]].append(
                 f'[Q{item["q_no"]}]({link})' if link else f'Q{item["q_no"]}'
             )
+
         correct = int(rank_item["correct"])
         wrong = int(rank_item["wrong"])
         skipped = int(rank_item["skipped"])
@@ -6599,6 +6711,7 @@ async def send_private_results(context, session_id: str) -> None:  # type: ignor
         if practice_url:
             buttons.append([InlineKeyboardButton("↺ Try Again", url=practice_url)])
         markup = InlineKeyboardMarkup(buttons) if buttons else None
+        reply_target = _session_start_message_id(session) if int(session["chat_id"]) == user_id else None
         await send_rich_or_html(
             context,
             user_id,
@@ -6606,7 +6719,9 @@ async def send_private_results(context, session_id: str) -> None:  # type: ignor
             "\n".join(html_lines),
             reply_markup=markup,
             plain=f'{session["title"]} — result',
+            reply_to=reply_target,
         )
+
         with suppress(Exception):
             html_doc = render_user_result_html(session, p, rank_item, ranking, review_items, section_data)
             await context.bot.send_document(
@@ -6700,7 +6815,10 @@ async def _finish_exam_with_rich_board(context, session_id: str, reason: str = "
             _ranking_markdown(session, ranking, limit=base.CONFIG.scoreboard_top_n),
             base.build_group_result_text(session, ranking, full=False)[:3800],
             plain="Final scoreboard",
+            reply_to=_session_start_message_id(session),
         )
+    _START_MSG_V8.pop(str(session_id), None)
+
 
 
 base.finish_exam = _finish_exam_with_rich_board
@@ -6793,25 +6911,61 @@ async def _deliver_sets(context, chat_id: int, user_id: int, draft_id: str, per_
             await context.bot.send_message(chat_id, f"▲️ Could not build sets: {base.html_escape(str(exc))}", parse_mode=ParseMode.HTML)
         return
     bot_username = context.bot_data.get("bot_username", "")
+    draft = base.get_draft(draft_id)
+    exam_title = str(draft["title"]).strip() if draft else "Practice Exam"
+    q_time = int(draft["question_time"]) if draft else 0
+    negative = draft["negative_mark"] if draft else 0
+    total_q = sum(int(i["count"]) for i in created)
+
     rows = []
-    html_lines = ["<b>Sets created</b>", ""]
+    html_lines = [
+        f"<b>{base.html_escape(exam_title)} — Practice Sets</b>",
+        "",
+        f"Total questions: <b>{total_q}</b> • Sets: <b>{len(created)}</b> • {q_time} sec/question • Negative: {negative}",
+        "",
+    ]
     for item in created:
-        url = _build_practice_url_v4(bot_username, item["draft_id"], user_id) or "—"
-        rows.append([f"Set {item['set_no']}", item["count"], item["draft_id"], f"[Open]({url})" if url != "—" else "—"])
+        url = _build_practice_url_v4(bot_username, item["draft_id"], user_id)
+        rows.append([
+            _md_link(f"Set {item['set_no']}", url),
+            item["count"],
+            f"{q_time} sec",
+            _md_link("Start", url),
+        ])
         html_lines.append(
-            f"<b>Set {item['set_no']}</b> — {item['count']} Q — <code>{item['draft_id']}</code>"
-            + (f' — <a href="{url}">Practice link</a>' if url != "—" else "")
+            (f'<b><a href="{url}">Set {item["set_no"]}</a></b>' if url else f"<b>Set {item['set_no']}</b>")
+            + f" — {item['count']} questions"
         )
+
     markdown = "\n".join([
-        "# Set Builder",
+        f"# {exam_title}",
         "",
-        f"Questions per set: **{per_set}** • Total sets: **{len(created)}**",
+        f"## Practice Sets ({len(created)})",
         "",
-        _md_table(["Set", "Questions", "Code", "Practice"], rows, ["c", "c", "l", "l"], 80),
+        _md_table(["Set", "Questions", "Time / Q", "Open"], rows, ["l", "c", "c", "c"], 80),
         "",
-        "> Each set is a full exam. Share the practice link, or bind the code in a group with `/binddraft CODE`.",
+        "## How to practice",
+        "",
+        "- [ ] Tap any **Set** link above to open the exam in the bot",
+        "- [ ] Press **Start** and answer every question before its timer ends",
+        "- [ ] Finish all sets in serial order for the best preparation",
+        "- [ ] Your score, rank and full answer review arrive right after each set",
+        "",
+        f"> {total_q} questions • {q_time} sec per question • Negative {negative} per wrong answer.",
+        "",
+        "---",
+        f"_{_md(base.CONFIG.brand_name)}_",
     ])
-    await send_rich_or_html(context, chat_id, markdown, "\n".join(html_lines), plain="Sets created")
+    html_lines.extend([
+        "",
+        "<b>How to practice</b>",
+        "• Tap a set link to open the exam in the bot",
+        "• Press Start and answer each question before its timer ends",
+        "• Finish the sets in serial order",
+        "• Score, rank and full review come right after each set",
+    ])
+    await send_rich_or_html(context, chat_id, markdown, "\n".join(html_lines), plain=f"{exam_title} — practice sets")
+
 
 
 # Add the Set Builder button to the draft edit panel.
