@@ -1790,10 +1790,12 @@ async def begin_or_advance_exam(context: ContextTypes.DEFAULT_TYPE, session_id: 
 async def close_poll_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     session_id = context.job.data["session_id"]
     q_no = context.job.data["q_no"]
-    # Telegram's PollAnswer delivery can trail the visible poll close slightly.
-    # This grace period lets the last accepted group vote enter the shared lock
-    # before the question/session advances.
-    await asyncio.sleep(0.45)
+    # Telegram's PollAnswer delivery can trail the visible poll close by more
+    # than a few hundred milliseconds. Keep the old poll/session addressable
+    # while already-accepted votes reach the answer handler. This is especially
+    # important on the final question, where advancing immediately finalizes
+    # the result and would reject every still-queued vote as a stopped session.
+    await asyncio.sleep(2.0)
     # Serialize timeout advancement with answer recording. At the timer edge a
     # PollAnswer and this job can arrive concurrently; advancing first used to
     # make that valid group vote unmappable or "not running" at finalization.

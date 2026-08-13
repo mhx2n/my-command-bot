@@ -9477,9 +9477,12 @@ async def _stop_exam_command_v16(update: Update, context: ContextTypes.DEFAULT_T
 
     session_id = str(session["id"])
     try:
-        # Telegram can deliver PollAnswer just after the command update. Wait
-        # before taking the shared lock so an in-flight answer can commit.
-        await asyncio.sleep(0.35)
+        # Telegram can show a vote in the poll UI before delivering its
+        # PollAnswer update to the bot.  With concurrent updates, /stoptqex may
+        # otherwise finalize first and produce an empty scoreboard.  Keep the
+        # session running long enough for those already-visible votes to enter
+        # the shared answer lock before result generation.
+        await asyncio.sleep(2.0)
         # Poll answers and stop/finalize must share one lock. Previously the
         # stop command could mark the session finished while Telegram's answer
         # update was committing, producing a zero-participant scoreboard.
