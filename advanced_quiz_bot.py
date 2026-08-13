@@ -7079,13 +7079,97 @@ base.callback_router = _callback_router_v8
 _prev_handle_text_v8 = base.handle_text
 
 
+_HEADER_KEYS_V8 = ("header", "হ্যাডার", "হেডার", "হেডিং")
+_FOOTER_KEYS_V8 = ("footer", "ফুটার", "ফুটার লেখা")
+
+
+def _parse_header_footer_v8(text: str) -> Optional[Tuple[str, str]]:
+    raw = (text or "").strip()
+    m = re.match(r"^([^\-–—:]{1,20})\s*[\-–—:]\s*(.+)$", raw, flags=re.S)
+    if not m:
+        return None
+    key = m.group(1).strip().lower()
+    value = m.group(2).strip()
+    if not value:
+        return None
+    if key in _HEADER_KEYS_V8:
+        return "header", value
+    if key in _FOOTER_KEYS_V8:
+        return "footer", value
+    return None
+
+
+async def _stop_active_exam_v8(update: Update, context, message, user, chat) -> bool:
+    """Resilient /stoptqex: stops any live session in this chat."""
+    target_chat = user.id if chat.type == "private" else chat.id
+    if chat.type in {"group", "supergroup"}:
+        with suppress(Exception):
+            if not await base.is_group_admin_or_global(update, context):
+                await base.handle_group_denied_command(update, context)
+                return True
+    session = None
+    with suppress(Exception):
+        session = base.DBH.fetchone(
+            "SELECT * FROM sessions WHERE chat_id=? AND status NOT IN ('finished','stopped') "
+            "ORDER BY started_at DESC LIMIT 1",
+            (target_chat,),
+        )
+    if not session:
+        await base.safe_reply(
+            message,
+            "There is no active practice or exam here right now."
+            if chat.type == "private"
+            else "There is no active exam in this group.",
+        )
+        return True
+    session_id = str(session["id"])
+    with suppress(Exception):
+        for job in context.job_queue.jobs():
+            if job.name and (job.name.startswith(f"close:{session_id}") or job.name.startswith(f"advance:{session_id}")):
+                job.schedule_removal()
+    with suppress(Exception):
+        base.DBH.execute(
+            "UPDATE sessions SET status='running' WHERE id=? AND status IN ('countdown','paused')",
+            (session_id,),
+        )
+    await base.safe_reply(message, "🛑 Stopping now. Your result is on the way.")
+    with suppress(Exception):
+        await base.finish_exam(context, session_id, reason="manual_stop")
+    return True
+
+
 async def _handle_text_v8(update: Update, context) -> None:
     message = update.effective_message
     user = update.effective_user
     chat = update.effective_chat
     if not message or not user or not chat or not getattr(message, "text", None):
         return await _prev_handle_text_v8(update, context)
+
+    raw_text = str(message.text or "").strip()
+    cmd_name = ""
+    with suppress(Exception):
+        cmd_name = (base.extract_command(raw_text, context.bot_data.get("bot_username", ""))[0] or "").lower()
+    if cmd_name == "stoptqex":
+        with suppress(Exception):
+            base.record_user(user)
+            base.record_chat(chat)
+        if await _stop_active_exam_v8(update, context, message, user, chat):
+            return
+
+    reply_src = getattr(message, "reply_to_message", None)
+    stored = _LAST_SETS_V8.get(int(user.id))
+    if reply_src and stored:
+        stored_mid = int(stored.get("message_id") or 0)
+        if stored_mid <= 0 or int(getattr(reply_src, "message_id", 0) or 0) in {stored_mid, stored_mid + 1}:
+            parsed = _parse_header_footer_v8(raw_text)
+            if parsed:
+                key, value = parsed
+                stored[key] = value
+                await _send_sets_message(context, chat.id, user.id, dict(stored))
+                return
+
     state, payload = base.get_user_state(user.id)
+
     if chat.type == "private" and state == "adv8_set_size":
         raw = (message.text or "").strip()
         draft_id = str(payload.get("draft_id") or "")
