@@ -9427,5 +9427,132 @@ def _build_app_v16():
 base.build_app = _build_app_v16
 
 
+# ============================================================
+# Patch v17 — single authoritative inbox answer/stop pipeline
+# ============================================================
+
+def _safe_negative_mark_v17(value: Any) -> float:
+    """Negative marking is a fraction of one correct mark, never an arbitrary score."""
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if not (0.0 <= parsed <= 1.0):
+        return 0.0
+    return round(parsed, 4)
+
+
+_create_session_before_v17 = base.create_session_from_draft
+
+
+def _create_session_v17(draft_id: str, chat_id: int, actor_id: int) -> Optional[str]:
+    draft = base.get_draft(draft_id)
+    if draft:
+        clean_negative = _safe_negative_mark_v17(draft["negative_mark"])
+        if float(draft["negative_mark"] or 0) != clean_negative:
+            base.DBH.execute(
+                "UPDATE drafts SET negative_mark=?, updated_at=? WHERE id=?",
+                (clean_negative, base.now_ts(), draft_id),
+            )
+            base.logger.warning("Repaired invalid negative mark on draft %s", draft_id)
+    return _create_session_before_v17(draft_id, chat_id, actor_id)
+
+
+base.create_session_from_draft = _create_session_v17
+
+
+async def _authoritative_poll_answer_v17(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    answer = update.poll_answer
+    user = answer.user if answer else None
+    if not answer or not user or not answer.option_ids:
+        raise ApplicationHandlerStop
+
+    qrow = base.get_question_by_poll(str(answer.poll_id))
+    if not qrow or str(qrow["session_status"]) != "running":
+        raise ApplicationHandlerStop
+    session_id = str(qrow["session_id"])
+
+    async with base._operation_lock(context, f"answer-v17:{session_id}:{qrow['q_no']}:{user.id}"):
+        session = base.get_session(session_id)
+        if not session or str(session["status"]) != "running":
+            raise ApplicationHandlerStop
+
+        selected = int(answer.option_ids[0])
+        correct = selected == int(qrow["correct_option"])
+        negative = _safe_negative_mark_v17(qrow["negative_mark"])
+        display_name = base.choose_name(
+            user.username, user.first_name, user.last_name, user.id
+        )
+        inserted = False
+        with closing(base.DBH.connect()) as conn:
+            exists = conn.execute(
+                "SELECT 1 FROM answers WHERE session_id=? AND q_no=? AND user_id=?",
+                (session_id, qrow["q_no"], user.id),
+            ).fetchone()
+            if not exists:
+                conn.execute(
+                    "INSERT INTO answers(session_id,q_no,user_id,selected_option,is_correct,answered_at) VALUES(?,?,?,?,?,?)",
+                    (session_id, qrow["q_no"], user.id, selected, 1 if correct else 0, base.now_ts()),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO participants(session_id,user_id,username,display_name,eligible,correct_count,wrong_count,score,last_answer_at)
+                    VALUES(?,?,?,?,1,?,?,?,?)
+                    ON CONFLICT(session_id,user_id) DO UPDATE SET
+                      username=excluded.username, display_name=excluded.display_name, eligible=1,
+                      correct_count=participants.correct_count+excluded.correct_count,
+                      wrong_count=participants.wrong_count+excluded.wrong_count,
+                      score=participants.score+excluded.score, last_answer_at=excluded.last_answer_at
+                    """,
+                    (
+                        session_id, user.id, user.username, display_name,
+                        1 if correct else 0, 0 if correct else 1,
+                        1.0 if correct else -negative, base.now_ts(),
+                    ),
+                )
+                conn.commit()
+                inserted = True
+
+        # Groups keep the shared timer. A private practice belongs to exactly
+        # one user, so their first answer closes the poll and advances now.
+        is_inbox = int(session["chat_id"]) == int(user.id)
+        if inserted and is_inbox:
+            base.DBH.execute(
+                "INSERT INTO known_chats(chat_id,title,username,chat_type,active,last_seen) VALUES(?,?,?,?,1,?) "
+                "ON CONFLICT(chat_id) DO UPDATE SET chat_type='private',active=1,last_seen=excluded.last_seen",
+                (user.id, user.full_name or str(user.id), user.username, "private", base.now_ts()),
+            )
+            for job in list(context.job_queue.jobs()):
+                name = str(job.name or "")
+                if name.startswith(f"close:{session_id}:") or name.startswith(f"advance:{session_id}:"):
+                    job.schedule_removal()
+            with suppress(TelegramError):
+                await context.bot.stop_poll(
+                    chat_id=int(session["chat_id"]),
+                    message_id=int(qrow["message_id"]),
+                )
+            base.set_session_active_poll(session_id, None, None)
+            await asyncio.sleep(0.15)
+            await base.begin_or_advance_exam(context, session_id)
+
+    raise ApplicationHandlerStop
+
+
+_build_app_before_v17 = base.build_app
+
+
+def _build_app_v17():
+    app = _build_app_before_v17()
+    from telegram.ext import CommandHandler as _CH17, PollAnswerHandler as _PAH17
+
+    # Earlier than every compatibility layer: one write, one advance, one stop.
+    app.add_handler(_CH17(["stoptqex", "stop"], _stop_exam_command_v16), group=-900)
+    app.add_handler(_PAH17(_authoritative_poll_answer_v17), group=-890)
+    return app
+
+
+base.build_app = _build_app_v17
+
+
 if __name__ == "__main__":
     base.main()
