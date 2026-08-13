@@ -7995,6 +7995,221 @@ async def _finish_exam_v10(context, session_id: str, reason: str = "completed") 
 base.finish_exam = _finish_exam_v10
 
 
+
+# ============================================================
+# Patch v11 — no duplicate start cards + rich group lobby
+# ============================================================
+
+_START_GUARD_V11: Dict[int, Any] = {}
+_LOBBY_MSG_V11: Dict[int, int] = {}
+
+
+def _lobby_markdown_v11(state: Dict[str, Any], count: int) -> str:
+    title = str(state.get("title") or "Exam")
+    return "\n".join([
+        f"# {_md(title)}",
+        "",
+        "## Exam Lobby",
+        "",
+        _md_table(
+            ["Item", "Value"],
+            [
+                ["Questions", state.get("questions", 0)],
+                ["Time / question", f'{state.get("question_time", 0)} sec'],
+                ["Negative / wrong", state.get("negative_mark", 0)],
+                ["Ready", f"{count}/2"],
+            ],
+            ["l", "r"],
+        ),
+        "",
+        "- [x] Press **Start Exam** below to join",
+        "- [x] The exam begins when 2 members are ready",
+        "",
+        "---",
+        f"_{_md(base.CONFIG.brand_name)}_",
+    ])
+
+
+def _lobby_html_v11(state: Dict[str, Any], count: int) -> str:
+    return "\n".join([
+        f'<b>{base.html_escape(str(state.get("title") or "Exam"))}</b>',
+        "",
+        f'Questions: <b>{state.get("questions", 0)}</b>',
+        f'Time / question: <b>{state.get("question_time", 0)} sec</b>',
+        f'Negative / wrong: <b>{state.get("negative_mark", 0)}</b>',
+        "",
+        f'Ready now: <b>{count}/2</b>',
+    ])
+
+
+def _lobby_keyboard_v11(chat_id: int):
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("✅ Start Exam", callback_data=f"startready:{chat_id}")]]
+    )
+
+
+async def _render_lobby_v11(context, chat_id: int, state: Dict[str, Any], count: int) -> None:
+    old = int(state.get("message_id") or 0) or _LOBBY_MSG_V11.get(chat_id, 0)
+    if old:
+        with suppress(Exception):
+            await context.bot.delete_message(chat_id=chat_id, message_id=int(old))
+    mid = 0
+    with suppress(Exception):
+        mid = await send_rich_or_html(
+            context,
+            chat_id,
+            _lobby_markdown_v11(state, count),
+            _lobby_html_v11(state, count),
+            reply_markup=_lobby_keyboard_v11(chat_id),
+            plain=f'{state.get("title")} — exam lobby',
+        )
+    if mid and mid > 0:
+        state["message_id"] = int(mid)
+        _LOBBY_MSG_V11[chat_id] = int(mid)
+        with suppress(Exception):
+            await base.safe_pin_message(context.bot, chat_id, int(mid))
+            await base.delete_service_pin_later(context, chat_id)
+    else:
+        state["message_id"] = None
+        _LOBBY_MSG_V11.pop(chat_id, None)
+
+
+async def _drop_lobby_v11(context, chat_id: int) -> None:
+    mid = _LOBBY_MSG_V11.pop(chat_id, 0)
+    if mid:
+        with suppress(Exception):
+            await context.bot.unpin_chat_message(chat_id=chat_id, message_id=int(mid))
+        with suppress(Exception):
+            await context.bot.delete_message(chat_id=chat_id, message_id=int(mid))
+
+
+_prev_handle_text_v11 = base.handle_text
+
+
+async def _handle_text_v11(update: Update, context) -> None:
+    message = update.effective_message
+    chat = update.effective_chat
+    cmd = ""
+    if message and message.text:
+        with suppress(Exception):
+            cmd = (base.extract_command(message.text, context.bot_data.get("bot_username", ""))[0] or "").lower()
+    result = await _prev_handle_text_v11(update, context)
+    if cmd == "starttqex" and chat and chat.type in {"group", "supergroup"}:
+        with suppress(Exception):
+            store = context.application.bot_data.get("ready_starts", {})
+            state = store.get(chat.id)
+            if state and state.get("message_id"):
+                await _render_lobby_v11(context, chat.id, state, len(state.get("users") or []))
+    return result
+
+
+base.handle_text = _handle_text_v11
+
+
+_prev_callback_router_v11 = base.callback_router
+
+
+async def _callback_router_v11(update: Update, context) -> None:
+    query = update.callback_query
+    data = str(getattr(query, "data", "") or "")
+    if not query or not data.startswith("startready:"):
+        return await _prev_callback_router_v11(update, context)
+    user = update.effective_user
+    try:
+        chat_id = int(data.split(":", 1)[1])
+    except Exception:
+        with suppress(Exception):
+            await query.answer()
+        return
+    store = context.application.bot_data.setdefault("ready_starts", {})
+    session_id = None
+    async with base._operation_lock(context, f"exam:{chat_id}"):
+        state = store.get(chat_id)
+        if not state:
+            with suppress(Exception):
+                await query.answer("This lobby is closed.", show_alert=False)
+            return
+        users = state.setdefault("users", [])
+        if user and user.id not in users:
+            users.append(user.id)
+        count = len(users)
+        if count < 2:
+            await _render_lobby_v11(context, chat_id, state, count)
+            with suppress(Exception):
+                await query.answer(f"Ready: {count}/2", show_alert=False)
+            return
+        if base.get_active_session(chat_id):
+            store.pop(chat_id, None)
+            with suppress(Exception):
+                await query.answer("An exam is already running in this group.", show_alert=False)
+            return
+        session_id = base.create_session_from_draft(state["draft_id"], chat_id, int(state["requested_by"]))
+        store.pop(chat_id, None)
+        if not session_id:
+            with suppress(Exception):
+                await query.answer("Could not create the session.", show_alert=True)
+            return
+    with suppress(Exception):
+        await query.answer("Starting…", show_alert=False)
+    await _drop_lobby_v11(context, chat_id)
+    base._spawn_background(context, base._start_exam_countdown_background(context, session_id))
+
+
+base.callback_router = _callback_router_v11
+
+
+async def _start_exam_countdown_v11(context, session_id: str, existing_message_id=None) -> None:
+    sid = str(session_id)
+    session = None
+    with suppress(Exception):
+        session = base.get_session(sid)
+    if not session:
+        return
+    chat_id = int(session["chat_id"])
+    now = base.now_ts()
+    prev = _START_GUARD_V11.get(chat_id)
+    if prev and str(prev[0]) != sid and (now - int(prev[1])) <= 90:
+        other = None
+        with suppress(Exception):
+            other = base.get_session(str(prev[0]))
+        if other and str(other["status"]) in {"countdown", "running"}:
+            # Duplicate start for the same chat — drop this extra session silently.
+            with suppress(Exception):
+                base.DBH.execute(
+                    "UPDATE sessions SET status='stopped', ended_at=? WHERE id=?", (now, sid)
+                )
+            if existing_message_id:
+                with suppress(Exception):
+                    await context.bot.delete_message(chat_id=chat_id, message_id=int(existing_message_id))
+            return
+    if prev and str(prev[0]) == sid:
+        return
+    _START_GUARD_V11[chat_id] = (sid, now)
+    await _drop_lobby_v11(context, chat_id)
+    try:
+        await _start_exam_countdown_v10(context, sid, existing_message_id)
+    finally:
+        pass
+
+
+base.start_exam_countdown = _start_exam_countdown_v11
+
+
+_prev_finish_exam_v11 = base.finish_exam
+
+
+async def _finish_exam_v11(context, session_id: str, reason: str = "completed") -> None:
+    sid = str(session_id)
+    for cid, val in list(_START_GUARD_V11.items()):
+        if str(val[0]) == sid:
+            _START_GUARD_V11.pop(cid, None)
+    _CARD_SENT_V9.discard(sid)
+    await _prev_finish_exam_v11(context, session_id, reason)
+
+
+base.finish_exam = _finish_exam_v11
+
+
 if __name__ == "__main__":
     base.main()
 
