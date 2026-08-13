@@ -6911,25 +6911,61 @@ async def _deliver_sets(context, chat_id: int, user_id: int, draft_id: str, per_
             await context.bot.send_message(chat_id, f"▲️ Could not build sets: {base.html_escape(str(exc))}", parse_mode=ParseMode.HTML)
         return
     bot_username = context.bot_data.get("bot_username", "")
+    draft = base.get_draft(draft_id)
+    exam_title = str(draft["title"]).strip() if draft else "Practice Exam"
+    q_time = int(draft["question_time"]) if draft else 0
+    negative = draft["negative_mark"] if draft else 0
+    total_q = sum(int(i["count"]) for i in created)
+
     rows = []
-    html_lines = ["<b>Sets created</b>", ""]
+    html_lines = [
+        f"<b>{base.html_escape(exam_title)} — Practice Sets</b>",
+        "",
+        f"Total questions: <b>{total_q}</b> • Sets: <b>{len(created)}</b> • {q_time} sec/question • Negative: {negative}",
+        "",
+    ]
     for item in created:
-        url = _build_practice_url_v4(bot_username, item["draft_id"], user_id) or "—"
-        rows.append([f"Set {item['set_no']}", item["count"], item["draft_id"], f"[Open]({url})" if url != "—" else "—"])
+        url = _build_practice_url_v4(bot_username, item["draft_id"], user_id)
+        rows.append([
+            _md_link(f"Set {item['set_no']}", url),
+            item["count"],
+            f"{q_time} sec",
+            _md_link("Start", url),
+        ])
         html_lines.append(
-            f"<b>Set {item['set_no']}</b> — {item['count']} Q — <code>{item['draft_id']}</code>"
-            + (f' — <a href="{url}">Practice link</a>' if url != "—" else "")
+            (f'<b><a href="{url}">Set {item["set_no"]}</a></b>' if url else f"<b>Set {item['set_no']}</b>")
+            + f" — {item['count']} questions"
         )
+
     markdown = "\n".join([
-        "# Set Builder",
+        f"# {exam_title}",
         "",
-        f"Questions per set: **{per_set}** • Total sets: **{len(created)}**",
+        f"## Practice Sets ({len(created)})",
         "",
-        _md_table(["Set", "Questions", "Code", "Practice"], rows, ["c", "c", "l", "l"], 80),
+        _md_table(["Set", "Questions", "Time / Q", "Open"], rows, ["l", "c", "c", "c"], 80),
         "",
-        "> Each set is a full exam. Share the practice link, or bind the code in a group with `/binddraft CODE`.",
+        "## How to practice",
+        "",
+        "- [ ] Tap any **Set** link above to open the exam in the bot",
+        "- [ ] Press **Start** and answer every question before its timer ends",
+        "- [ ] Finish all sets in serial order for the best preparation",
+        "- [ ] Your score, rank and full answer review arrive right after each set",
+        "",
+        f"> {total_q} questions • {q_time} sec per question • Negative {negative} per wrong answer.",
+        "",
+        "---",
+        f"_{_md(base.CONFIG.brand_name)}_",
     ])
-    await send_rich_or_html(context, chat_id, markdown, "\n".join(html_lines), plain="Sets created")
+    html_lines.extend([
+        "",
+        "<b>How to practice</b>",
+        "• Tap a set link to open the exam in the bot",
+        "• Press Start and answer each question before its timer ends",
+        "• Finish the sets in serial order",
+        "• Score, rank and full review come right after each set",
+    ])
+    await send_rich_or_html(context, chat_id, markdown, "\n".join(html_lines), plain=f"{exam_title} — practice sets")
+
 
 
 # Add the Set Builder button to the draft edit panel.
