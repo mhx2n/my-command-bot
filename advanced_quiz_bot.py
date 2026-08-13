@@ -2420,8 +2420,8 @@ async def handle_text(update: Update, context) -> None:
             except ValueError:
                 await base.safe_reply(message, "Send a valid decimal value. Example: 0.25")
                 return
-            if not 0.0 <= neg <= 1.0:
-                await base.safe_reply(message, "Negative mark must be between 0 and 1. Example: 0.25")
+            if not math.isfinite(neg) or neg < 0.0:
+                await base.safe_reply(message, "Negative mark must be zero or a positive number. Example: 0.25")
                 return
             draft = resolve_editable_draft(user.id, " ".join(parts[:-1]))
             if not draft:
@@ -3742,12 +3742,12 @@ async def handle_text(update: Update, context) -> None:
         elif state == 'adv2_edit_neg':
             try:
                 neg = float(txt)
-                if not 0.0 <= neg <= 1.0:
+                if not math.isfinite(neg) or neg < 0.0:
                     raise ValueError("negative mark out of range")
                 base.DBH.execute('UPDATE drafts SET negative_mark=?, updated_at=? WHERE id=?', (neg, base.now_ts(), draft_id))
                 header = f'◆ Negative mark updated to <b>{neg}</b>.'
             except Exception:
-                header = '▲️ Negative mark must be between 0 and 1. Example: <code>0.25</code>'
+                header = '▲️ Negative mark must be zero or a positive number. Example: <code>0.25</code>'
         elif state == 'adv2_add_questions':
             parsed = parse_marked_questions_from_text(txt)
             if not parsed:
