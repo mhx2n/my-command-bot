@@ -8307,14 +8307,14 @@ def _share_card_html_v12(
 ) -> str:
     table = _share_table_v13(
         [
-            ("🆔 Quiz ID", str(code)),
-            ("📚 Questions", str(q_count)),
-            ("⏱ Time / Q", f"{q_time} sec"),
-            ("➖ Negative", str(negative)),
+            ("Quiz ID", str(code)),
+            ("Questions", str(q_count)),
+            ("Time / Q", f"{q_time} sec"),
+            ("Negative", str(negative)),
         ]
     )
     lines = [
-        f"🎯 <b>{base.html_escape(title)}</b>",
+        f"🎯 <b>{base.html_escape(title)}</b>  ✦",
         f"<pre>{base.html_escape(table)}</pre>",
     ]
     note = get_share_note_v13()
