@@ -6579,20 +6579,25 @@ def _build_rich_result_markdown(session, rank_item, section_data, buckets_plain,
     parts.append("")
     parts.append(
         _md_table(
-            ["Status", "Questions"],
+            ["Status", "Count"],
             [
-                ["Correct", buckets_plain["correct"] or "—"],
-                ["Wrong", buckets_plain["wrong"] or "—"],
-                ["Skipped", buckets_plain["skipped"] or "—"],
+                ["✔ Correct", meta["correct"]],
+                ["✘ Wrong", meta["wrong"]],
+                ["– Skipped", meta["skipped"]],
             ],
-            ["l", "l"],
-            220,
+            ["l", "r"],
         )
     )
     parts.append("")
+    for key, label in (("correct", "✔ Correct questions"), ("wrong", "✘ Wrong questions"), ("skipped", "– Skipped questions")):
+        parts.append(f"**{label}**")
+        parts.append("")
+        parts.append(buckets_plain.get(key) or "—")
+        parts.append("")
     parts.append("---")
     parts.append(f"_{_md(base.CONFIG.brand_name)}_")
     return "\n".join(parts)
+
 
 
 async def send_private_results(context, session_id: str) -> None:  # type: ignore[no-redef]
