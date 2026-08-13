@@ -2419,6 +2419,9 @@ async def handle_text(update: Update, context) -> None:
             except ValueError:
                 await base.safe_reply(message, "Send a valid decimal value. Example: 0.25")
                 return
+            if not 0.0 <= neg <= 1.0:
+                await base.safe_reply(message, "Negative mark must be between 0 and 1. Example: 0.25")
+                return
             draft = resolve_editable_draft(user.id, " ".join(parts[:-1]))
             if not draft:
                 await base.safe_reply(message, "Draft not found, or you do not have access.")
@@ -3738,10 +3741,12 @@ async def handle_text(update: Update, context) -> None:
         elif state == 'adv2_edit_neg':
             try:
                 neg = float(txt)
+                if not 0.0 <= neg <= 1.0:
+                    raise ValueError("negative mark out of range")
                 base.DBH.execute('UPDATE drafts SET negative_mark=?, updated_at=? WHERE id=?', (neg, base.now_ts(), draft_id))
                 header = f'◆ Negative mark updated to <b>{neg}</b>.'
             except Exception:
-                header = '▲️ Send a valid decimal value. Example: <code>0.25</code>'
+                header = '▲️ Negative mark must be between 0 and 1. Example: <code>0.25</code>'
         elif state == 'adv2_add_questions':
             parsed = parse_marked_questions_from_text(txt)
             if not parsed:
@@ -9386,28 +9391,39 @@ async def _stop_exam_command_v16(update: Update, context: ContextTypes.DEFAULT_T
         raise ApplicationHandlerStop
 
     session_id = str(session["id"])
-    async with base._operation_lock(context, f"stop-v16:{session_id}"):
-        current = base.get_session(session_id)
-        if not current or str(current["status"]) in {"finished", "stopped"}:
-            await base.safe_reply(message, "This exam has already ended.")
-            raise ApplicationHandlerStop
+    try:
+        async with base._operation_lock(context, f"stop-v16:{session_id}"):
+            current = base.get_session(session_id)
+            if not current or str(current["status"]) in {"finished", "stopped"}:
+                await base.safe_reply(message, "This exam has already ended.")
+                return
 
-        for job in list(context.job_queue.jobs()):
-            name = str(job.name or "")
-            if name.startswith(f"close:{session_id}") or name.startswith(f"advance:{session_id}"):
-                job.schedule_removal()
-        if current["active_poll_message_id"]:
-            with suppress(TelegramError):
-                await context.bot.stop_poll(
-                    chat_id=int(current["chat_id"]),
-                    message_id=int(current["active_poll_message_id"]),
-                )
-        # finish_exam ignores countdown/paused only when a stale wrapper sees
-        # those states, therefore normalize to running immediately beforehand.
-        base.DBH.execute("UPDATE sessions SET status='running' WHERE id=?", (session_id,))
-        await base.finish_exam(context, session_id, reason="manual_stop")
-
-    raise ApplicationHandlerStop
+            for job in list(context.job_queue.jobs()):
+                name = str(job.name or "")
+                if name.startswith(f"close:{session_id}") or name.startswith(f"advance:{session_id}"):
+                    job.schedule_removal()
+            poll_message_id = current["active_poll_message_id"]
+            if poll_message_id is not None:
+                try:
+                    await context.bot.stop_poll(
+                        chat_id=int(current["chat_id"]),
+                        message_id=int(poll_message_id),
+                    )
+                except Exception as exc:
+                    base.logger.info("Could not close poll while stopping %s: %s", session_id, exc)
+            # Normalize before finalization so countdown and paused sessions
+            # produce the same partial result as a running session.
+            base.DBH.execute("UPDATE sessions SET status='running' WHERE id=?", (session_id,))
+            await base.finish_exam(context, session_id, reason="manual_stop")
+    except Exception:
+        base.logger.exception("Manual stop failed for session %s", session_id)
+        # Do not leave a broken session running indefinitely. Retry the result
+        # delivery once after restoring the state expected by finish_exam.
+        with suppress(Exception):
+            base.DBH.execute("UPDATE sessions SET status='running' WHERE id=?", (session_id,))
+            await base.finish_exam(context, session_id, reason="manual_stop")
+    finally:
+        raise ApplicationHandlerStop
 
 
 _orig_build_app_v16 = base.build_app
@@ -9425,6 +9441,169 @@ def _build_app_v16():
 
 
 base.build_app = _build_app_v16
+
+
+# ============================================================
+# Patch v17 — single authoritative inbox answer/stop pipeline
+# ============================================================
+
+def _safe_negative_mark_v17(value: Any) -> float:
+    """Negative marking is a fraction of one correct mark, never an arbitrary score."""
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if not (0.0 <= parsed <= 1.0):
+        return 0.0
+    return round(parsed, 4)
+
+
+_create_draft_before_v17 = base.create_draft
+_create_session_before_v17 = base.create_session_from_draft
+
+
+def _create_draft_v17(owner_id: int, title: str, question_time: int, negative_mark: float) -> str:
+    return _create_draft_before_v17(
+        owner_id,
+        title,
+        question_time,
+        _safe_negative_mark_v17(negative_mark),
+    )
+
+
+def _create_session_v17(draft_id: str, chat_id: int, actor_id: int) -> Optional[str]:
+    draft = base.get_draft(draft_id)
+    if draft:
+        clean_negative = _safe_negative_mark_v17(draft["negative_mark"])
+        if float(draft["negative_mark"] or 0) != clean_negative:
+            base.DBH.execute(
+                "UPDATE drafts SET negative_mark=?, updated_at=? WHERE id=?",
+                (clean_negative, base.now_ts(), draft_id),
+            )
+            base.logger.warning("Repaired invalid negative mark on draft %s", draft_id)
+    return _create_session_before_v17(draft_id, chat_id, actor_id)
+
+
+base.create_draft = _create_draft_v17
+base.create_session_from_draft = _create_session_v17
+
+
+async def _authoritative_poll_answer_v17(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    answer = update.poll_answer
+    user = answer.user if answer else None
+    if not answer or not user or not answer.option_ids:
+        raise ApplicationHandlerStop
+
+    qrow = base.get_question_by_poll(str(answer.poll_id))
+    if not qrow or str(qrow["session_status"]) != "running":
+        raise ApplicationHandlerStop
+    session_id = str(qrow["session_id"])
+
+    should_advance = False
+    try:
+        async with base._operation_lock(context, f"answer-v17:{session_id}:{qrow['q_no']}:{user.id}"):
+            session = base.get_session(session_id)
+            if not session or str(session["status"]) != "running":
+                return
+
+            selected = int(answer.option_ids[0])
+            correct = selected == int(qrow["correct_option"])
+            negative = _safe_negative_mark_v17(qrow["negative_mark"])
+            display_name = base.choose_name(
+                user.username, user.first_name, user.last_name, user.id
+            )
+            inserted = False
+            with closing(base.DBH.connect()) as conn:
+                exists = conn.execute(
+                    "SELECT 1 FROM answers WHERE session_id=? AND q_no=? AND user_id=?",
+                    (session_id, qrow["q_no"], user.id),
+                ).fetchone()
+                if not exists:
+                    conn.execute(
+                        "INSERT INTO answers(session_id,q_no,user_id,selected_option,is_correct,answered_at) VALUES(?,?,?,?,?,?)",
+                        (session_id, qrow["q_no"], user.id, selected, 1 if correct else 0, base.now_ts()),
+                    )
+                    conn.execute(
+                        """
+                        INSERT INTO participants(session_id,user_id,username,display_name,eligible,correct_count,wrong_count,score,last_answer_at)
+                        VALUES(?,?,?,?,1,?,?,?,?)
+                        ON CONFLICT(session_id,user_id) DO UPDATE SET
+                          username=excluded.username, display_name=excluded.display_name, eligible=1,
+                          correct_count=participants.correct_count+excluded.correct_count,
+                          wrong_count=participants.wrong_count+excluded.wrong_count,
+                          score=participants.score+excluded.score, last_answer_at=excluded.last_answer_at
+                        """,
+                        (
+                            session_id, user.id, user.username, display_name,
+                            1 if correct else 0, 0 if correct else 1,
+                            1.0 if correct else -negative, base.now_ts(),
+                        ),
+                    )
+                    conn.commit()
+                    inserted = True
+
+            # Groups keep the shared timer. A private practice belongs to
+            # exactly one user, so the first answer advances immediately.
+            is_inbox = int(session["chat_id"]) == int(user.id)
+            should_advance = inserted and is_inbox
+            if should_advance:
+                base.DBH.execute(
+                    "INSERT INTO known_chats(chat_id,title,username,chat_type,active,last_seen) VALUES(?,?,?,?,1,?) "
+                    "ON CONFLICT(chat_id) DO UPDATE SET chat_type='private',active=1,last_seen=excluded.last_seen",
+                    (user.id, user.full_name or str(user.id), user.username, "private", base.now_ts()),
+                )
+                for job in list(context.job_queue.jobs()):
+                    name = str(job.name or "")
+                    if name.startswith(f"close:{session_id}:") or name.startswith(f"advance:{session_id}:"):
+                        job.schedule_removal()
+                try:
+                    await context.bot.stop_poll(
+                        chat_id=int(session["chat_id"]),
+                        message_id=int(qrow["message_id"]),
+                    )
+                except Exception as exc:
+                    base.logger.info("Could not close answered inbox poll %s: %s", answer.poll_id, exc)
+                base.set_session_active_poll(session_id, None, None)
+                await asyncio.sleep(0.15)
+                await base.begin_or_advance_exam(context, session_id)
+    except Exception:
+        base.logger.exception("Authoritative poll-answer flow failed for %s", session_id)
+        # Once the answer was committed, a transport/UI failure must not make
+        # the user wait for the old timer. Queue a guarded fallback advance.
+        if should_advance:
+            with suppress(Exception):
+                context.job_queue.run_once(
+                    base.begin_or_advance_exam_job,
+                    when=0.2,
+                    data={"session_id": session_id},
+                    name=f"advance:{session_id}:fallback:{qrow['q_no']}",
+                )
+    finally:
+        raise ApplicationHandlerStop
+
+
+_build_app_before_v17 = base.build_app
+
+
+def _build_app_v17():
+    # Repair historical corrupt values restored from old backups before they
+    # can leak into cards, scoring, or newly-created sessions.
+    base.DBH.execute(
+        "UPDATE drafts SET negative_mark=0 WHERE negative_mark < 0 OR negative_mark > 1"
+    )
+    base.DBH.execute(
+        "UPDATE sessions SET negative_mark=0 WHERE negative_mark < 0 OR negative_mark > 1"
+    )
+    app = _build_app_before_v17()
+    from telegram.ext import CommandHandler as _CH17, PollAnswerHandler as _PAH17
+
+    # Earlier than every compatibility layer: one write, one advance, one stop.
+    app.add_handler(_CH17(["stoptqex", "stop"], _stop_exam_command_v16), group=-900)
+    app.add_handler(_PAH17(_authoritative_poll_answer_v17), group=-890)
+    return app
+
+
+base.build_app = _build_app_v17
 
 
 if __name__ == "__main__":
