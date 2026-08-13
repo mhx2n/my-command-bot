@@ -8520,12 +8520,6 @@ def _build_app_v12():
 base.build_app = _build_app_v12
 
 
-if __name__ == "__main__":
-    base.main()
-
-
-
-
 # ============================================================
 # Patch v14 — Backup vault (snapshots, restore, storage usage)
 # and unbroken text rendering in the offline HTML exam
@@ -9314,3 +9308,124 @@ def render_scroll_exam_html(draft: Any, owner_id: int) -> str:  # type: ignore[n
     )
     html = html.replace("</style>", _theme_readability_css_v15() + "</style>", 1)
     return html
+
+
+# ============================================================
+# Patch v16 — deterministic inbox advance + reliable /stoptqex
+# ============================================================
+
+async def _inbox_poll_answer_v16(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Process a poll answer before lower-priority handlers.
+
+    Telegram poll-answer updates do not include the source chat.  For an inbox
+    practice the session chat id is the answering user's id, so explicitly keep
+    that chat registered as private before delegating to the canonical answer
+    handler.  The canonical handler records the answer, closes the current poll,
+    cancels its timeout and queues the next question after 0.2 seconds.
+    """
+    answer = getattr(update, "poll_answer", None)
+    user = getattr(answer, "user", None) if answer else None
+    if not answer or not user or not getattr(answer, "option_ids", None):
+        raise ApplicationHandlerStop
+
+    qrow = base.get_question_by_poll(str(answer.poll_id))
+    if not qrow:
+        raise ApplicationHandlerStop
+    session = base.get_session(str(qrow["session_id"]))
+    if not session or str(session["status"]) != "running":
+        raise ApplicationHandlerStop
+
+    # A positive Telegram chat id is a private inbox. Group ids are negative.
+    if int(session["chat_id"]) == int(user.id):
+        base.DBH.execute(
+            """
+            INSERT INTO known_chats(chat_id, title, username, chat_type, active, last_seen)
+            VALUES(?,?,?,?,1,?)
+            ON CONFLICT(chat_id) DO UPDATE SET
+                title=excluded.title, username=excluded.username,
+                chat_type='private', active=1, last_seen=excluded.last_seen
+            """,
+            (
+                int(user.id),
+                user.full_name or str(user.id),
+                user.username,
+                "private",
+                base.now_ts(),
+            ),
+        )
+
+    await base.handle_poll_answer(update, context)
+    raise ApplicationHandlerStop
+
+
+async def _stop_exam_command_v16(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Stop the latest live session and synchronously produce its partial result."""
+    message = update.effective_message
+    user = update.effective_user
+    chat = update.effective_chat
+    if not message or not user or not chat:
+        raise ApplicationHandlerStop
+
+    if chat.type in {"group", "supergroup"} and not await base.is_group_admin_or_global(update, context):
+        await base.handle_group_denied_command(update, context)
+        raise ApplicationHandlerStop
+
+    target_chat_id = int(user.id) if chat.type == "private" else int(chat.id)
+    session = base.DBH.fetchone(
+        "SELECT * FROM sessions WHERE chat_id=? AND status IN ('countdown','running','paused') "
+        "ORDER BY started_at DESC LIMIT 1",
+        (target_chat_id,),
+    )
+    if not session:
+        await base.safe_reply(
+            message,
+            "There is no active practice or exam in your inbox."
+            if chat.type == "private"
+            else "There is no active exam in this group.",
+        )
+        raise ApplicationHandlerStop
+
+    session_id = str(session["id"])
+    async with base._operation_lock(context, f"stop-v16:{session_id}"):
+        current = base.get_session(session_id)
+        if not current or str(current["status"]) in {"finished", "stopped"}:
+            await base.safe_reply(message, "This exam has already ended.")
+            raise ApplicationHandlerStop
+
+        for job in list(context.job_queue.jobs()):
+            name = str(job.name or "")
+            if name.startswith(f"close:{session_id}") or name.startswith(f"advance:{session_id}"):
+                job.schedule_removal()
+        if current["active_poll_message_id"]:
+            with suppress(TelegramError):
+                await context.bot.stop_poll(
+                    chat_id=int(current["chat_id"]),
+                    message_id=int(current["active_poll_message_id"]),
+                )
+        # finish_exam ignores countdown/paused only when a stale wrapper sees
+        # those states, therefore normalize to running immediately beforehand.
+        base.DBH.execute("UPDATE sessions SET status='running' WHERE id=?", (session_id,))
+        await base.finish_exam(context, session_id, reason="manual_stop")
+
+    raise ApplicationHandlerStop
+
+
+_orig_build_app_v16 = base.build_app
+
+
+def _build_app_v16():
+    app = _orig_build_app_v16()
+    from telegram.ext import CommandHandler as _CH16, PollAnswerHandler as _PAH16
+
+    # These run before every historical compatibility handler. Stopping the
+    # propagation also prevents duplicate answer writes/results.
+    app.add_handler(_CH16("stoptqex", _stop_exam_command_v16), group=-700)
+    app.add_handler(_PAH16(_inbox_poll_answer_v16), group=-690)
+    return app
+
+
+base.build_app = _build_app_v16
+
+
+if __name__ == "__main__":
+    base.main()
