@@ -6043,7 +6043,9 @@ def owner_private_commands() -> List[BotCommand]:
         BotCommand("cleardefaultexplanation", "Clear default explanation"),
         BotCommand("exporttheme", "Set or list result themes"),
         BotCommand("backupnow", "Create a database backup"),
+        BotCommand("backups", "Backup vault: list, size, restore"),
         BotCommand("restorebackup", "Restore latest backup"),
+
         BotCommand("restart", "Restart bot"),
     ])
 
@@ -8522,3 +8524,470 @@ if __name__ == "__main__":
     base.main()
 
 
+
+
+# ============================================================
+# Patch v14 — Backup vault (snapshots, restore, storage usage)
+# and unbroken text rendering in the offline HTML exam
+# ============================================================
+
+import base64 as _b64_v14
+import time as _time_v14
+from datetime import datetime as _dt_v14
+
+# ------------------------------------------------------------
+# 1) Text rendering fix — never send Bangla/Unicode prose to MathJax
+# ------------------------------------------------------------
+
+_INDIC_RE_V14 = re.compile(r'[\u0900-\u0DFF\u4E00-\u9FFF\u0600-\u06FF]')
+_LATEX_CMD_RE_V14 = re.compile(
+    r'\\(?:frac|dfrac|tfrac|sqrt|left|right|begin|end|sum|int|prod|lim|overline|underline|'
+    r'vec|hat|bar|binom|matrix|cdot|times|div|pm|mp|leq|geq|neq|approx|infty|pi|theta|alpha|'
+    r'beta|gamma|delta|lambda|mu|sigma|omega|phi|displaystyle|textstyle|mathrm|mathbb|operatorname)\b'
+)
+_MATH_DELIM_RE_V14 = re.compile(r'\$[^$\n]{1,300}\$|\\\(.{1,300}?\\\)|\\\[.{1,300}?\\\]', re.S)
+_SUP_SUB_RE_V14 = re.compile(r'[A-Za-z0-9\)\]\}]\s*[\^_]\s*\{?[A-Za-z0-9+\-]')
+
+
+def _contains_math_markup(text: str) -> bool:  # type: ignore[no-redef]
+    """Strict math detection.
+
+    Bangla (and other non-Latin) text is *never* handed to MathJax — that is
+    what produced the broken/garbled glyphs in the offline HTML exam. Such
+    content is rendered through the pretty-text path instead, which converts
+    LaTeX to readable Unicode.
+    """
+    s = str(text or '')
+    if not s.strip():
+        return False
+    if _INDIC_RE_V14.search(s):
+        return False
+    if _LATEX_CMD_RE_V14.search(s):
+        return True
+    m = _MATH_DELIM_RE_V14.search(s)
+    if m and re.search(r'[A-Za-z0-9\\^_]', m.group(0)):
+        return True
+    return bool(_SUP_SUB_RE_V14.search(s))
+
+
+# ------------------------------------------------------------
+# 2) Backup vault helpers
+# ------------------------------------------------------------
+
+def _backup_dir_v14() -> str:
+    path = str(getattr(base, "GITHUB_STATE_PATH", "") or "backups/bot_state.json")
+    return path.rsplit("/", 1)[0] if "/" in path else "backups"
+
+
+def _snapshot_dir_v14() -> str:
+    return f"{_backup_dir_v14()}/snapshots"
+
+
+def _gh_ready_v14() -> bool:
+    return bool(getattr(base, "GITHUB_TOKEN", "") and getattr(base, "GITHUB_REPO", ""))
+
+
+def _fmt_bytes_v14(n: Any) -> str:
+    try:
+        size = float(n or 0)
+    except Exception:
+        size = 0.0
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024:
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} TB"
+
+
+def _gh_list_dir_v14(path: str) -> List[Dict[str, Any]]:
+    if not _gh_ready_v14():
+        return []
+    url = base._github_contents_url(path) + f"?ref={urllib.parse.quote(base.GITHUB_BRANCH, safe='')}"
+    try:
+        data = base._github_request("GET", url)
+    except Exception:
+        return []
+    if not isinstance(data, list):
+        return []
+    out: List[Dict[str, Any]] = []
+    for item in data:
+        if isinstance(item, dict) and item.get("type") == "file" and str(item.get("name", "")).endswith(".json"):
+            out.append({
+                "name": str(item.get("name")),
+                "path": str(item.get("path")),
+                "size": int(item.get("size") or 0),
+            })
+    return out
+
+
+def _gh_file_meta_v14(path: str) -> Optional[Dict[str, Any]]:
+    if not _gh_ready_v14():
+        return None
+    url = base._github_contents_url(path) + f"?ref={urllib.parse.quote(base.GITHUB_BRANCH, safe='')}"
+    try:
+        data = base._github_request("GET", url)
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    return {"name": str(data.get("name") or path), "path": path, "size": int(data.get("size") or 0)}
+
+
+def _gh_upload_json_v14(path: str, payload: Dict[str, Any], message: str) -> int:
+    """Upload a JSON payload, returning the uploaded byte size (0 on failure)."""
+    body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+    url = base._github_contents_url(path)
+    sha = None
+    with suppress(Exception):
+        existing = base._github_request("GET", f"{url}?ref={urllib.parse.quote(base.GITHUB_BRANCH, safe='')}")
+        if isinstance(existing, dict):
+            sha = existing.get("sha")
+    req: Dict[str, Any] = {
+        "message": message,
+        "content": _b64_v14.b64encode(body).decode("ascii"),
+        "branch": base.GITHUB_BRANCH,
+    }
+    if sha:
+        req["sha"] = sha
+    base._github_request("PUT", url, req)
+    return len(body)
+
+
+def _backup_now_v14() -> Dict[str, Any]:
+    """Owner-triggered backup: main state file + a timestamped snapshot."""
+    payload = export_backup_payload_v8()
+    rows = sum(len(v or []) for v in (payload.get("tables") or {}).values())
+    stamp = _dt_v14.now().strftime("%Y%m%d-%H%M%S")
+    main_size = _gh_upload_json_v14(base.GITHUB_STATE_PATH, payload, "Update bot state backup")
+    snap_path = f"{_snapshot_dir_v14()}/state-{stamp}.json"
+    snap_size = 0
+    with suppress(Exception):
+        snap_size = _gh_upload_json_v14(snap_path, payload, f"Snapshot backup {stamp}")
+    return {
+        "rows": rows,
+        "tables": len(payload.get("tables") or {}),
+        "main_size": main_size,
+        "snapshot_path": snap_path if snap_size else "",
+        "snapshot_size": snap_size,
+    }
+
+
+def _restore_from_path_v14(path: str) -> Tuple[bool, int]:
+    """Restore any backup file (main or snapshot) back into the bot database."""
+    raw = base._download_github_file_bytes(path)
+    if not raw:
+        return False, 0
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except Exception as exc:
+        base.logger.warning("Invalid backup file %s: %s", path, exc)
+        return False, 0
+    tables = payload.get("tables") if isinstance(payload, dict) else None
+    if not isinstance(tables, dict):
+        return False, 0
+    restored = 0
+    with closing(base.DBH.connect()) as conn:
+        for table, rows in tables.items():
+            if not isinstance(rows, list) or not _table_exists_v8(conn, table):
+                continue
+            columns = _table_columns_v8(conn, table)
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                cols = [c for c in columns if c in row]
+                if not cols:
+                    continue
+                sql = (
+                    f"INSERT OR REPLACE INTO {table}({','.join(cols)}) "
+                    f"VALUES({','.join('?' for _ in cols)})"
+                )
+                try:
+                    conn.execute(sql, tuple(row.get(c) for c in cols))
+                    restored += 1
+                except Exception:
+                    continue
+        conn.commit()
+    for row in tables.get("user_visuals", []) or []:
+        with suppress(Exception):
+            base.restore_thumbnail_file_from_github(int(row.get("user_id")), row.get("thumb_github_path"))
+    base.logger.info("Restore complete: %s rows from %s", restored, path)
+    return restored > 0, restored
+
+
+def _backup_inventory_v14() -> Dict[str, Any]:
+    main = _gh_file_meta_v14(base.GITHUB_STATE_PATH)
+    snaps = sorted(_gh_list_dir_v14(_snapshot_dir_v14()), key=lambda x: x["name"], reverse=True)
+    total = (main["size"] if main else 0) + sum(s["size"] for s in snaps)
+    db_size = 0
+    with suppress(Exception):
+        db_size = base.DBH.path.stat().st_size
+    return {"main": main, "snapshots": snaps, "total": total, "db_size": db_size}
+
+
+_BACKUP_CACHE_V14: Dict[int, List[Dict[str, Any]]] = {}
+
+
+def _backup_panel_v14(inv: Dict[str, Any]) -> Tuple[str, str, Any]:
+    main = inv["main"]
+    snaps = inv["snapshots"]
+    rows: List[List[Any]] = []
+    if main:
+        rows.append(["Latest", main["path"], _fmt_bytes_v14(main["size"])])
+    for idx, s in enumerate(snaps[:10], start=1):
+        rows.append([f"#{idx}", s["name"].replace("state-", "").replace(".json", ""), _fmt_bytes_v14(s["size"])])
+    if not rows:
+        rows.append(["—", "no backup yet", "0 B"])
+    md = "\n".join([
+        "# 💾 Backup Vault",
+        "",
+        _md_table(["Slot", "Backup", "Size"], rows, ["c", "l", "r"], 48),
+        "",
+        _md_table(
+            ["Storage", "Value"],
+            [
+                ["Repository", base.GITHUB_REPO or "not configured"],
+                ["Snapshots", str(len(snaps))],
+                ["Backup space used", _fmt_bytes_v14(inv["total"])],
+                ["Local database", _fmt_bytes_v14(inv["db_size"])],
+                ["Auto backup", "off (manual only)"],
+            ],
+            ["l", "r"],
+            48,
+        ),
+    ])
+    html_rows = "\n".join(
+        f"• <b>{base.html_escape(r[0])}</b> — <code>{base.html_escape(str(r[1]))}</code> ({r[2]})"
+        for r in rows
+    )
+    html = (
+        "<b>💾 Backup Vault</b>\n\n"
+        f"{html_rows}\n\n"
+        f"<b>Repository:</b> <code>{base.html_escape(base.GITHUB_REPO or 'not configured')}</code>\n"
+        f"<b>Snapshots:</b> {len(snaps)}\n"
+        f"<b>Backup space used:</b> {_fmt_bytes_v14(inv['total'])}\n"
+        f"<b>Local database:</b> {_fmt_bytes_v14(inv['db_size'])}\n"
+        f"<b>Auto backup:</b> off (manual only)"
+    )
+    buttons: List[List[InlineKeyboardButton]] = [[
+        InlineKeyboardButton("⬆️ Backup now", callback_data="bk14:new"),
+        InlineKeyboardButton("🔄 Refresh", callback_data="bk14:list"),
+    ]]
+    if main:
+        buttons.append([InlineKeyboardButton("⬇️ Restore latest", callback_data="bk14:ask:main")])
+    row: List[InlineKeyboardButton] = []
+    for idx, _s in enumerate(snaps[:10], start=1):
+        row.append(InlineKeyboardButton(f"⬇️ #{idx}", callback_data=f"bk14:ask:{idx - 1}"))
+        if len(row) == 5:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    return md, html, InlineKeyboardMarkup(buttons)
+
+
+async def cmd_backups_v14(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    user = update.effective_user
+    if not message or not user:
+        return
+    if not base.is_owner(user.id):
+        await base.safe_reply(message, "Only the bot owner can manage backups.")
+        raise ApplicationHandlerStop
+    if not _gh_ready_v14():
+        await message.reply_text(
+            "❌ GitHub backup is not configured.\n"
+            "Set <code>GITHUB_TOKEN</code> and <code>GITHUB_REPO</code>, then redeploy.",
+            parse_mode=ParseMode.HTML,
+        )
+        raise ApplicationHandlerStop
+    notice = await message.reply_text("⏳ Loading backup vault…")
+    inv = await asyncio.get_event_loop().run_in_executor(None, _backup_inventory_v14)
+    _BACKUP_CACHE_V14[user.id] = inv["snapshots"]
+    md, html, markup = _backup_panel_v14(inv)
+    with suppress(Exception):
+        await notice.delete()
+    await send_rich_or_html(context, message.chat_id, md, html, reply_markup=markup, plain="Backup vault")
+    raise ApplicationHandlerStop
+
+
+async def cmd_backupnow_v14(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    user = update.effective_user
+    if not message or not user:
+        return
+    if not base.is_owner(user.id):
+        await base.safe_reply(message, "Only the bot owner can trigger backups.")
+        raise ApplicationHandlerStop
+    if not _gh_ready_v14():
+        await message.reply_text(
+            "❌ GitHub backup is not configured.\n"
+            "Set <code>GITHUB_TOKEN</code> and <code>GITHUB_REPO</code>, then redeploy.",
+            parse_mode=ParseMode.HTML,
+        )
+        raise ApplicationHandlerStop
+    notice = await message.reply_text("⏳ Backing up…")
+    try:
+        info = await asyncio.get_event_loop().run_in_executor(None, _backup_now_v14)
+        inv = await asyncio.get_event_loop().run_in_executor(None, _backup_inventory_v14)
+        _BACKUP_CACHE_V14[user.id] = inv["snapshots"]
+        text = (
+            "✅ <b>Backup complete</b>\n\n"
+            f"<b>File:</b> <code>{base.html_escape(base.GITHUB_STATE_PATH)}</code>\n"
+            f"<b>Size:</b> {_fmt_bytes_v14(info['main_size'])}\n"
+            f"<b>Snapshot:</b> <code>{base.html_escape(info['snapshot_path'] or '—')}</code>\n"
+            f"<b>Rows:</b> {info['rows']} in {info['tables']} tables\n"
+            f"<b>Total backup space:</b> {_fmt_bytes_v14(inv['total'])} "
+            f"({len(inv['snapshots'])} snapshots)\n"
+            f"<b>Local database:</b> {_fmt_bytes_v14(inv['db_size'])}\n\n"
+            "Use /backups to restore any backup."
+        )
+        await notice.edit_text(text, parse_mode=ParseMode.HTML)
+    except Exception as exc:
+        await notice.edit_text(
+            f"❌ Backup error: <code>{base.html_escape(str(exc))}</code>", parse_mode=ParseMode.HTML
+        )
+    raise ApplicationHandlerStop
+
+
+def _resolve_backup_path_v14(user_id: int, key: str) -> Tuple[str, str]:
+    if key == "main":
+        return base.GITHUB_STATE_PATH, "latest backup"
+    snaps = _BACKUP_CACHE_V14.get(user_id) or []
+    try:
+        item = snaps[int(key)]
+    except Exception:
+        return "", ""
+    return str(item["path"]), str(item["name"])
+
+
+async def on_backup_cb_v14(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query or not query.data:
+        return
+    user = update.effective_user
+    if not user or not base.is_owner(user.id):
+        with suppress(Exception):
+            await query.answer("Owner only.", show_alert=True)
+        return
+    data = query.data.split(":")
+    action = data[1] if len(data) > 1 else ""
+    with suppress(Exception):
+        await query.answer()
+
+    if action in {"list", "new"}:
+        if action == "new":
+            with suppress(Exception):
+                await query.edit_message_text("⏳ Backing up…")
+            with suppress(Exception):
+                await asyncio.get_event_loop().run_in_executor(None, _backup_now_v14)
+        inv = await asyncio.get_event_loop().run_in_executor(None, _backup_inventory_v14)
+        _BACKUP_CACHE_V14[user.id] = inv["snapshots"]
+        md, html, markup = _backup_panel_v14(inv)
+        with suppress(Exception):
+            await query.message.delete()
+        await send_rich_or_html(
+            context, query.message.chat_id, md, html, reply_markup=markup, plain="Backup vault"
+        )
+        return
+
+    if action == "ask":
+        key = data[2] if len(data) > 2 else ""
+        path, label = _resolve_backup_path_v14(user.id, key)
+        if not path:
+            with suppress(Exception):
+                await query.answer("This backup is no longer listed. Refresh the vault.", show_alert=True)
+            return
+        markup = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Yes, restore", callback_data=f"bk14:do:{key}"),
+            InlineKeyboardButton("✖️ Cancel", callback_data="bk14:list"),
+        ]])
+        with suppress(Exception):
+            await query.message.reply_text(
+                "⚠️ <b>Restore backup?</b>\n\n"
+                f"<code>{base.html_escape(path)}</code>\n\n"
+                "Existing rows with the same ids will be overwritten by the backup data.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=markup,
+            )
+        return
+
+    if action == "do":
+        key = data[2] if len(data) > 2 else ""
+        path, label = _resolve_backup_path_v14(user.id, key)
+        if not path:
+            return
+        with suppress(Exception):
+            await query.edit_message_text("⏳ Restoring backup…")
+        try:
+            ok, rows = await asyncio.get_event_loop().run_in_executor(
+                None, _restore_from_path_v14, path
+            )
+        except Exception as exc:
+            with suppress(Exception):
+                await query.edit_message_text(
+                    f"❌ Restore error: <code>{base.html_escape(str(exc))}</code>",
+                    parse_mode=ParseMode.HTML,
+                )
+            return
+        if ok:
+            text = (
+                "✅ <b>Restore complete</b>\n\n"
+                f"<b>Source:</b> <code>{base.html_escape(path)}</code>\n"
+                f"<b>Rows restored:</b> {rows}\n"
+                "All quizzes, questions, admins and links are back in the bot."
+            )
+        else:
+            text = "⚠️ Nothing restored — the backup file was empty or unreadable."
+        with suppress(Exception):
+            await query.edit_message_text(text, parse_mode=ParseMode.HTML)
+        return
+
+
+async def cmd_restorebackup_v14(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    user = update.effective_user
+    if not message or not user:
+        return
+    if not base.is_owner(user.id):
+        await base.safe_reply(message, "Only the bot owner can restore backups.")
+        raise ApplicationHandlerStop
+    if not _gh_ready_v14():
+        await message.reply_text("❌ GitHub backup is not configured.")
+        raise ApplicationHandlerStop
+    notice = await message.reply_text("⏳ Restoring latest backup…")
+    try:
+        ok, rows = await asyncio.get_event_loop().run_in_executor(
+            None, _restore_from_path_v14, base.GITHUB_STATE_PATH
+        )
+        if ok:
+            await notice.edit_text(
+                "✅ <b>Restore complete</b>\n"
+                f"<b>Rows restored:</b> {rows}\n"
+                f"<b>Source:</b> <code>{base.html_escape(base.GITHUB_STATE_PATH)}</code>",
+                parse_mode=ParseMode.HTML,
+            )
+        else:
+            await notice.edit_text("⚠️ No backup found, or the backup was empty.")
+    except Exception as exc:
+        await notice.edit_text(
+            f"❌ Restore error: <code>{base.html_escape(str(exc))}</code>", parse_mode=ParseMode.HTML
+        )
+    raise ApplicationHandlerStop
+
+
+_orig_build_app_v14 = base.build_app
+
+
+def _build_app_v14():
+    app = _orig_build_app_v14()
+    with suppress(Exception):
+        from telegram.ext import CallbackQueryHandler as _CQ14, CommandHandler as _CH14
+
+        app.add_handler(_CH14(["backups", "backupvault"], cmd_backups_v14), group=-170)
+        app.add_handler(_CH14("backupnow", cmd_backupnow_v14), group=-170)
+        app.add_handler(_CH14("restorebackup", cmd_restorebackup_v14), group=-170)
+        app.add_handler(_CQ14(on_backup_cb_v14, pattern=r"^bk14:"), group=-170)
+    return app
+
+
+base.build_app = _build_app_v14
