@@ -7134,7 +7134,9 @@ async def _stop_active_exam_v8(update: Update, context, message, user, chat) -> 
             "UPDATE sessions SET status='running' WHERE id=? AND status IN ('countdown','paused')",
             (session_id,),
         )
-    await base.safe_reply(message, "🛑 Stopping now. Your result is on the way.")
+    with suppress(Exception):
+        await context.bot.send_chat_action(chat_id=message.chat_id, action="typing")
+
     with suppress(Exception):
         await base.finish_exam(context, session_id, reason="manual_stop")
     return True
