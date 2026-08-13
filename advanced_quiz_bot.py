@@ -9633,7 +9633,7 @@ async def _authoritative_poll_answer_v17(update: Update, context: ContextTypes.D
                 break
             if attempt < 29:
                 await asyncio.sleep(0.1)
-        if not qrow or str(qrow["session_status"]) != "running":
+        if not qrow:
             base.logger.warning(
                 "Unmapped poll answer after retry: poll_id=%s user_id=%s",
                 answer.poll_id,
@@ -9647,7 +9647,12 @@ async def _authoritative_poll_answer_v17(update: Update, context: ContextTypes.D
         # SQLite and occasionally lose the participant update.
         async with base._operation_lock(context, f"exam-answer:{session_id}"):
             session = base.get_session(session_id)
-            if not session or str(session["status"]) != "running":
+            # Accept an answer that Telegram already accepted while a manual
+            # stop/timeout was racing with delivery.  The poll-id mapping is
+            # authoritative; only a previously delivered final result is too
+            # late to alter.
+            finish_done = context.application.bot_data.get("_finish_delivery_done", {})
+            if not session or finish_done.get(session_id):
                 return
 
             selected = int(answer.option_ids[0])
@@ -9798,6 +9803,16 @@ def _build_app_v17():
     )
     app = _build_app_before_v17()
     from telegram.ext import CommandHandler as _CH17, PollAnswerHandler as _PAH17
+
+    # Remove every inherited PollAnswerHandler.  Keeping the old group=0
+    # handler as a fallback made failures non-deterministic and, on retries,
+    # could double-advance private exams.  There must be exactly one owner of
+    # vote persistence.
+    for group, handlers in list(app.handlers.items()):
+        app.handlers[group] = [
+            handler for handler in handlers
+            if not isinstance(handler, _PAH17)
+        ]
 
     # Earlier than every compatibility layer: one write, one advance, one stop.
     app.add_handler(_CH17(["stoptqex", "stop"], _stop_exam_command_v16), group=-900)
