@@ -159,7 +159,7 @@ def apply_user_quiz_filters(user_id: Optional[int], text: str) -> str:
 
 
 QUESTION_BRAND_PREFIX = "[TQX]"
-DEFAULT_POLL_BRAND = "[ 𝝿𝞃𝞀 ]"
+DEFAULT_POLL_BRAND = "[ 𝕿𝖃𝕼 ]"
 
 
 def _strip_question_brand_prefix(text: str) -> str:
