@@ -5467,8 +5467,8 @@ def _unicode_scripts_v18(text: str) -> str:
     # caret (for example 10−4).  Preserve normal prose numbers, but promote it
     # when it directly follows a power-of-ten base or a physical unit.
     value = re.sub(
-        r"(?<=(?:10|cm|mm|km|ms|m|s))\s*[−-]([0-9]{1,2})\b",
-        lambda m: ("-" + m.group(1)).translate(_SUPERSCRIPT_V18),
+        r"\b(10|cm|mm|km|ms|m|s)\s*[−-]([0-9]{1,2})\b",
+        lambda m: m.group(1) + ("-" + m.group(2)).translate(_SUPERSCRIPT_V18),
         value,
     )
     return value
@@ -9476,6 +9476,9 @@ async def _stop_exam_command_v16(update: Update, context: ContextTypes.DEFAULT_T
 
     session_id = str(session["id"])
     try:
+        # Telegram can deliver PollAnswer just after the command update. Wait
+        # before taking the shared lock so an in-flight answer can commit.
+        await asyncio.sleep(0.35)
         # Poll answers and stop/finalize must share one lock. Previously the
         # stop command could mark the session finished while Telegram's answer
         # update was committing, producing a zero-participant scoreboard.
@@ -9489,10 +9492,6 @@ async def _stop_exam_command_v16(update: Update, context: ContextTypes.DEFAULT_T
                 name = str(job.name or "")
                 if name.startswith(f"close:{session_id}") or name.startswith(f"advance:{session_id}"):
                     job.schedule_removal()
-            # Telegram can deliver the PollAnswer a fraction after the user's
-            # command update. Give that already-cast vote a short delivery
-            # window before freezing the partial result.
-            await asyncio.sleep(0.35)
             poll_message_id = current["active_poll_message_id"]
             if poll_message_id is not None:
                 try:
