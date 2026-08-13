@@ -1459,6 +1459,54 @@ def get_session_ranking(session_id: str) -> List[Dict[str, Any]]:
     session = get_session(session_id)
     if not session:
         return []
+    # Keep the result recoverable even if an older/interrupted answer handler
+    # committed answers but failed before updating participants.  Telegram can
+    # also identify an anonymous group vote by voter_chat instead of user; such
+    # chat IDs intentionally have no known_users row but remain rankable.
+    answer_users = DBH.fetchall(
+        "SELECT DISTINCT user_id FROM answers WHERE session_id=?",
+        (session_id,),
+    )
+    for answer_user in answer_users:
+        user_id = int(answer_user["user_id"])
+        totals = DBH.fetchone(
+            "SELECT COUNT(*) AS answered, COALESCE(SUM(is_correct),0) AS correct, "
+            "COALESCE(MAX(answered_at),0) AS last_answer FROM answers WHERE session_id=? AND user_id=?",
+            (session_id, user_id),
+        )
+        if not totals:
+            continue
+        correct_count = int(totals["correct"] or 0)
+        wrong_count = max(0, int(totals["answered"] or 0) - correct_count)
+        known = DBH.fetchone(
+            "SELECT username, first_name, last_name FROM known_users WHERE user_id=?",
+            (user_id,),
+        )
+        username = known["username"] if known else None
+        first_name = known["first_name"] if known else None
+        last_name = known["last_name"] if known else None
+        display_name = choose_name(username, first_name, last_name, user_id)
+        DBH.execute(
+            """
+            INSERT INTO participants(session_id,user_id,username,display_name,eligible,correct_count,wrong_count,score,last_answer_at)
+            VALUES(?,?,?,?,1,?,?,?,?)
+            ON CONFLICT(session_id,user_id) DO UPDATE SET
+              username=COALESCE(excluded.username,participants.username),
+              display_name=COALESCE(participants.display_name,excluded.display_name),
+              eligible=1,correct_count=excluded.correct_count,wrong_count=excluded.wrong_count,
+              score=excluded.score,last_answer_at=excluded.last_answer_at
+            """,
+            (
+                session_id,
+                user_id,
+                username,
+                display_name,
+                correct_count,
+                wrong_count,
+                float(correct_count) - (float(wrong_count) * float(session["negative_mark"] or 0)),
+                int(totals["last_answer"] or 0),
+            ),
+        )
     rows = DBH.fetchall(
         """
         SELECT p.*, ku.first_name, ku.last_name
@@ -1742,10 +1790,12 @@ async def begin_or_advance_exam(context: ContextTypes.DEFAULT_TYPE, session_id: 
 async def close_poll_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     session_id = context.job.data["session_id"]
     q_no = context.job.data["q_no"]
-    # Telegram's PollAnswer delivery can trail the visible poll close slightly.
-    # This grace period lets the last accepted group vote enter the shared lock
-    # before the question/session advances.
-    await asyncio.sleep(0.45)
+    # Telegram's PollAnswer delivery can trail the visible poll close by more
+    # than a few hundred milliseconds. Keep the old poll/session addressable
+    # while already-accepted votes reach the answer handler. This is especially
+    # important on the final question, where advancing immediately finalizes
+    # the result and would reject every still-queued vote as a stopped session.
+    await asyncio.sleep(2.0)
     # Serialize timeout advancement with answer recording. At the timer edge a
     # PollAnswer and this job can arrive concurrently; advancing first used to
     # make that valid group vote unmappable or "not running" at finalization.
