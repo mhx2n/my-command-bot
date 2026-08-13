@@ -6623,8 +6623,6 @@ def _build_rich_result_markdown(session, rank_item, section_data, buckets_plain,
 
 async def send_private_results(context, session_id: str) -> None:  # type: ignore[no-redef]
     """Rich (table) personal result with automatic HTML fallback."""
-    if not rich_available():
-        return await _prev_send_private_results_v8(context, session_id)
     session = base.get_session(session_id)
     if not session:
         return
@@ -6743,7 +6741,7 @@ async def send_private_results(context, session_id: str) -> None:  # type: ignor
             reply_to=reply_target,
         )
 
-        with suppress(Exception):
+        try:
             html_doc = render_user_result_html(session, p, rank_item, ranking, review_items, section_data)
             await context.bot.send_document(
                 user_id,
@@ -6753,6 +6751,9 @@ async def send_private_results(context, session_id: str) -> None:  # type: ignor
                 ),
                 caption="▤ HTML result report.",
             )
+        except Exception:
+            base.logger.exception("Failed to send HTML result for session %s to user %s", session_id, user_id)
+            raise
 
 
 base.send_private_results = send_private_results
@@ -9478,12 +9479,8 @@ _orig_build_app_v16 = base.build_app
 
 def _build_app_v16():
     app = _orig_build_app_v16()
-    from telegram.ext import CommandHandler as _CH16, PollAnswerHandler as _PAH16
-
-    # These run before every historical compatibility handler. Stopping the
-    # propagation also prevents duplicate answer writes/results.
-    app.add_handler(_CH16("stoptqex", _stop_exam_command_v16), group=-700)
-    app.add_handler(_PAH16(_inbox_poll_answer_v16), group=-690)
+    # v17 owns poll answers and stop commands. Keep this compatibility wrapper
+    # registration-free so the same update can never enter two patch layers.
     return app
 
 
@@ -9536,18 +9533,20 @@ base.create_session_from_draft = _create_session_v17
 
 
 async def _authoritative_poll_answer_v17(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    answer = update.poll_answer
-    user = answer.user if answer else None
-    if not answer or not user or not answer.option_ids:
-        raise ApplicationHandlerStop
-
-    qrow = base.get_question_by_poll(str(answer.poll_id))
-    if not qrow or str(qrow["session_status"]) != "running":
-        raise ApplicationHandlerStop
-    session_id = str(qrow["session_id"])
-
+    session_id = "unknown"
+    qrow = None
     should_advance = False
     try:
+        answer = update.poll_answer
+        user = answer.user if answer else None
+        if not answer or not user or not answer.option_ids:
+            return
+
+        qrow = base.get_question_by_poll(str(answer.poll_id))
+        if not qrow or str(qrow["session_status"]) != "running":
+            return
+        session_id = str(qrow["session_id"])
+
         async with base._operation_lock(context, f"private-exam:{session_id}"):
             session = base.get_session(session_id)
             if not session or str(session["status"]) != "running":
@@ -9617,7 +9616,7 @@ async def _authoritative_poll_answer_v17(update: Update, context: ContextTypes.D
         base.logger.exception("Authoritative poll-answer flow failed for %s", session_id)
         # Once the answer was committed, a transport/UI failure must not make
         # the user wait for the old timer. Queue a guarded fallback advance.
-        if should_advance:
+        if should_advance and qrow is not None:
             with suppress(Exception):
                 context.job_queue.run_once(
                     base.begin_or_advance_exam_job,
