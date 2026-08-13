@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import json
+import math
 import random
 import re
 import unicodedata
@@ -2419,8 +2420,8 @@ async def handle_text(update: Update, context) -> None:
             except ValueError:
                 await base.safe_reply(message, "Send a valid decimal value. Example: 0.25")
                 return
-            if not 0.0 <= neg <= 1.0:
-                await base.safe_reply(message, "Negative mark must be between 0 and 1. Example: 0.25")
+            if not math.isfinite(neg) or neg < 0.0:
+                await base.safe_reply(message, "Negative mark must be zero or a positive number. Example: 0.25")
                 return
             draft = resolve_editable_draft(user.id, " ".join(parts[:-1]))
             if not draft:
@@ -3741,12 +3742,12 @@ async def handle_text(update: Update, context) -> None:
         elif state == 'adv2_edit_neg':
             try:
                 neg = float(txt)
-                if not 0.0 <= neg <= 1.0:
+                if not math.isfinite(neg) or neg < 0.0:
                     raise ValueError("negative mark out of range")
                 base.DBH.execute('UPDATE drafts SET negative_mark=?, updated_at=? WHERE id=?', (neg, base.now_ts(), draft_id))
                 header = f'◆ Negative mark updated to <b>{neg}</b>.'
             except Exception:
-                header = '▲️ Negative mark must be between 0 and 1. Example: <code>0.25</code>'
+                header = '▲️ Negative mark must be zero or a positive number. Example: <code>0.25</code>'
         elif state == 'adv2_add_questions':
             parsed = parse_marked_questions_from_text(txt)
             if not parsed:
@@ -9461,6 +9462,15 @@ async def _stop_exam_command_v16(update: Update, context: ContextTypes.DEFAULT_T
                     base.logger.info("Could not close poll while stopping %s: %s", session_id, exc)
             # Normalize before finalization so countdown and paused sessions
             # produce the same partial result as a running session.
+            if chat.type == "private":
+                # finish_exam determines the delivery format from known_chats.
+                # Seed it here as well so stopping before the first answer still
+                # produces the personal result and HTML report.
+                base.DBH.execute(
+                    "INSERT INTO known_chats(chat_id,title,username,chat_type,active,last_seen) VALUES(?,?,?,?,1,?) "
+                    "ON CONFLICT(chat_id) DO UPDATE SET chat_type='private',active=1,last_seen=excluded.last_seen",
+                    (user.id, user.full_name or str(user.id), user.username, "private", base.now_ts()),
+                )
             base.DBH.execute("UPDATE sessions SET status='running' WHERE id=?", (session_id,))
             await base.finish_exam(context, session_id, reason="manual_stop")
     except Exception:
@@ -9492,14 +9502,14 @@ base.build_app = _build_app_v16
 # ============================================================
 
 def _safe_negative_mark_v17(value: Any) -> float:
-    """Negative marking is a fraction of one correct mark, never an arbitrary score."""
+    """Keep every valid non-negative mark instead of silently changing it to zero."""
     try:
         parsed = float(value)
     except (TypeError, ValueError):
         return 0.0
-    if not (0.0 <= parsed <= 1.0):
+    if not math.isfinite(parsed) or parsed < 0.0:
         return 0.0
-    return round(parsed, 4)
+    return round(parsed, 6)
 
 
 _create_draft_before_v17 = base.create_draft
@@ -9550,6 +9560,22 @@ async def _authoritative_poll_answer_v17(update: Update, context: ContextTypes.D
         qrow = None
         for attempt in range(8):
             qrow = base.get_question_by_poll(str(answer.poll_id))
+            if qrow is None:
+                # Compatibility with restored/older databases where the poll
+                # id reached sessions before session_questions was committed.
+                qrow = base.DBH.fetchone(
+                    """
+                    SELECT sq.*, s.chat_id, s.title, s.question_time,
+                           s.negative_mark, s.total_questions,
+                           s.status AS session_status
+                    FROM sessions s
+                    JOIN session_questions sq
+                      ON sq.session_id=s.id AND sq.q_no=s.current_index
+                    WHERE s.active_poll_id=?
+                    LIMIT 1
+                    """,
+                    (str(answer.poll_id),),
+                )
             if qrow is not None:
                 break
             if attempt < 7:
@@ -9622,6 +9648,7 @@ async def _authoritative_poll_answer_v17(update: Update, context: ContextTypes.D
             )
             is_inbox = (
                 int(session["chat_id"]) == int(user.id)
+                or int(session["chat_id"]) > 0
                 or (chat_row is not None and str(chat_row["chat_type"]) == "private")
             )
             should_advance = inserted and is_inbox
@@ -9676,13 +9703,13 @@ _build_app_before_v17 = base.build_app
 
 
 def _build_app_v17():
-    # Repair historical corrupt values restored from old backups before they
-    # can leak into cards, scoring, or newly-created sessions.
+    # Repair only invalid values. Values above one are intentionally valid:
+    # older working builds allowed owners to choose any non-negative penalty.
     base.DBH.execute(
-        "UPDATE drafts SET negative_mark=0 WHERE negative_mark < 0 OR negative_mark > 1"
+        "UPDATE drafts SET negative_mark=0 WHERE negative_mark < 0"
     )
     base.DBH.execute(
-        "UPDATE sessions SET negative_mark=0 WHERE negative_mark < 0 OR negative_mark > 1"
+        "UPDATE sessions SET negative_mark=0 WHERE negative_mark < 0"
     )
     app = _build_app_before_v17()
     from telegram.ext import CommandHandler as _CH17, PollAnswerHandler as _PAH17
