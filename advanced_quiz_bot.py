@@ -6711,6 +6711,7 @@ async def send_private_results(context, session_id: str) -> None:  # type: ignor
         if practice_url:
             buttons.append([InlineKeyboardButton("↺ Try Again", url=practice_url)])
         markup = InlineKeyboardMarkup(buttons) if buttons else None
+        reply_target = _session_start_message_id(session) if int(session["chat_id"]) == user_id else None
         await send_rich_or_html(
             context,
             user_id,
@@ -6718,7 +6719,9 @@ async def send_private_results(context, session_id: str) -> None:  # type: ignor
             "\n".join(html_lines),
             reply_markup=markup,
             plain=f'{session["title"]} — result',
+            reply_to=reply_target,
         )
+
         with suppress(Exception):
             html_doc = render_user_result_html(session, p, rank_item, ranking, review_items, section_data)
             await context.bot.send_document(
