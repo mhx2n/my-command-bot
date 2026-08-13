@@ -6977,7 +6977,8 @@ async def _send_sets_message(context, chat_id: int, user_id: int, payload: Dict[
     payload["chat_id"] = chat_id
     payload["message_id"] = int(mid or 0)
     _LAST_SETS_V8[int(user_id)] = payload
-    with suppress(Exception):
+    if chat_id > 0:
+      with suppress(Exception):
         await context.bot.send_message(
             chat_id,
             "▤ Reply to the list above with <code>header - your text</code> or "
