@@ -1143,12 +1143,10 @@ async def _start_practice_locked(update: Update, context: ContextTypes.DEFAULT_T
     if not session_id:
         await base.safe_reply(message, "Could not create the practice session.")
         return
-    sent = await base.safe_reply(
-        message,
-        f"<b>Practice Ready</b>\n<b>{base.html_escape(_normalize_multiline_visual_text(row['title']))}</b>\n\nQuestions: <b>{q_count}</b>\nTime / question: <b>{row['question_time']} sec</b>\nNegative / wrong: <b>{row['negative_mark']}</b>",
-        parse_mode=ParseMode.HTML,
-    )
-    await base.start_exam_countdown(context, session_id, existing_message_id=sent.message_id if sent else None)
+    # The countdown renderer is the single owner of all start UI.  Sending a
+    # separate "Practice Ready" message here created a legacy card and made
+    # concurrent /start handlers appear to start the same exam twice.
+    await base.start_exam_countdown(context, session_id)
 
 
 base.start_practice_from_token = start_practice_from_token
@@ -6210,8 +6208,13 @@ try:
                     message.text, context.bot_data.get("bot_username", "")
                 )
             if (args_text or "").strip().startswith("practice_"):
-                # let original chain handle deep-link practice
-                return await _prev_handle_text_final(update, context)
+                # Consume practice deep links in this highest-priority handler.
+                # Calling the old text-handler chain and then returning allowed
+                # the same Telegram update to reach the normal TEXT handler too,
+                # which created the duplicate session/card seen in inboxes.
+                token = (args_text or "").strip()[len("practice_"):]
+                await start_practice_from_token(update, context, token)
+                raise ApplicationHandlerStop
             if (args_text or "").strip():
                 handled = await start_practice_from_draft_code(update, context, args_text)
                 if handled:
@@ -8088,19 +8091,63 @@ _prev_handle_text_v11 = base.handle_text
 
 async def _handle_text_v11(update: Update, context) -> None:
     message = update.effective_message
+    user = update.effective_user
     chat = update.effective_chat
     cmd = ""
+    args = ""
     if message and message.text:
         with suppress(Exception):
-            cmd = (base.extract_command(message.text, context.bot_data.get("bot_username", ""))[0] or "").lower()
-    result = await _prev_handle_text_v11(update, context)
-    if cmd == "starttqex" and chat and chat.type in {"group", "supergroup"}:
-        with suppress(Exception):
-            store = context.application.bot_data.get("ready_starts", {})
-            state = store.get(chat.id)
-            if state and state.get("message_id"):
-                await _render_lobby_v11(context, chat.id, state, len(state.get("users") or []))
-    return result
+            cmd, args = base.extract_command(message.text, context.bot_data.get("bot_username", ""))
+            cmd = (cmd or "").lower()
+
+    # Intercept group starts BEFORE the legacy handler sends its HTML lobby.
+    # The previous implementation called the legacy chain first and attempted
+    # to replace its message afterwards, leaving the old card visible whenever
+    # deletion/editing raced or failed.
+    if cmd == "starttqex" and message and user and chat and chat.type in {"group", "supergroup"}:
+        base.record_user(user)
+        base.record_chat(chat)
+        if not await base.is_group_admin_or_global(update, context):
+            await base.handle_group_denied_command(update, context)
+            return
+        async with base._operation_lock(context, f"exam:{chat.id}"):
+            if base.get_active_session(chat.id):
+                await base.safe_reply(message, "An exam is already running in this group.")
+                return
+            draft_code = (args or "").strip().upper()
+            draft = base.get_draft(draft_code) if draft_code else base.resolve_group_draft_for_actor(chat.id, user.id)
+            if draft_code and draft and int(draft["owner_id"]) not in base.OWNER_SET and int(draft["owner_id"]) != user.id and user.id not in base.all_admin_ids():
+                await base.safe_reply(message, "You are not allowed to use that draft code.")
+                return
+            if not draft:
+                await base.safe_reply(message, "Set or bind a ready draft first, or run .starttqex DRAFTCODE.")
+                return
+            qrow = base.DBH.fetchone("SELECT COUNT(*) AS c FROM draft_questions WHERE draft_id=?", (draft["id"],))
+            q_count = int(qrow["c"] if qrow else 0)
+            if q_count <= 0:
+                await base.safe_reply(message, "The selected draft does not have any questions yet.")
+                return
+            store = context.application.bot_data.setdefault("ready_starts", {})
+            old_state = store.get(chat.id) or {}
+            old_mid = int(old_state.get("message_id") or 0)
+            if old_mid:
+                with suppress(Exception):
+                    await context.bot.delete_message(chat_id=chat.id, message_id=old_mid)
+            state = {
+                "draft_id": draft["id"],
+                "requested_by": user.id,
+                "title": draft["title"],
+                "question_time": int(draft["question_time"]),
+                "negative_mark": float(draft["negative_mark"]),
+                "questions": q_count,
+                "users": [],
+                "message_id": None,
+            }
+            store[chat.id] = state
+        await _render_lobby_v11(context, chat.id, state, 0)
+        return
+
+    return await _prev_handle_text_v11(update, context)
 
 
 base.handle_text = _handle_text_v11
