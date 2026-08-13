@@ -7041,7 +7041,8 @@ async def _callback_router_v8(update: Update, context) -> None:
         return await _prev_callback_router_v8(update, context)
     user = query.from_user
     await query.answer()
-    if not user or not base.user_has_staff_access(user.id):
+    if not user or not _is_privileged(user.id):
+
         return
     parts = query.data.split(":")
     action = parts[1] if len(parts) > 1 else ""
