@@ -7341,7 +7341,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             )
         _spawn_background(context, _finish_exam_background(context, session_id, reason="manual_stop"))
         await show_page(
-            f"🛑 Stop requested for <b>{html_escape(session['title'])}</b> in chat <code>{session['chat_id']}</code>.\n\nFinal result delivery is running in the background.",
+            f"🛑 Stop requested for <b>{html_escape(session['title'])}</b> in chat <code>{session['chat_id']}</code>.",
             panel_back_keyboard(is_owner(user.id)),
         )
         return
@@ -8117,7 +8117,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             )
         _spawn_background(context, _finish_exam_background(context, session_id, reason="manual_stop"))
         await show_page(
-            f"🛑 Stop requested for <b>{html_escape(session['title'])}</b> in chat <code>{session['chat_id']}</code>.\n\nFinal result delivery is running in the background.",
+            f"🛑 Stop requested for <b>{html_escape(session['title'])}</b> in chat <code>{session['chat_id']}</code>.",
             panel_back_keyboard(is_owner(user.id)),
         )
         return
