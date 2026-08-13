@@ -8305,18 +8305,24 @@ def _share_card_html_v12(
     practice_url: str,
     html_url: str,
 ) -> str:
-    table = _share_table_v13(
-        [
-            ("Quiz ID", str(code)),
-            ("Questions", str(q_count)),
-            ("Time / Q", f"{q_time} sec"),
-            ("Negative", str(negative)),
-        ]
-    )
+    def _num(val: Any) -> str:
+        try:
+            f = float(val)
+        except Exception:
+            return str(val)
+        return str(int(f)) if f == int(f) else f"{f:g}"
+
+    rule = "━━━━━━━━━━━━━━━━━━━━"
     lines = [
         f"🎯 <b>{base.html_escape(title)}</b>  ✦",
-        f"<pre>{base.html_escape(table)}</pre>",
+        rule,
+        f"🆔 <b>Quiz ID</b> · <code>{base.html_escape(str(code))}</code>",
+        f"📚 <b>Questions</b> · <b>{q_count}</b>",
+        f"⏱️ <b>Time / Question</b> · <b>{q_time} sec</b>",
+        f"➖ <b>Negative Mark</b> · <b>{_num(negative)}</b>",
+        rule,
     ]
+
     note = get_share_note_v13()
     if note:
         body = _sanitize_note_html_v13(note)
