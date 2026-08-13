@@ -8263,6 +8263,39 @@ def _share_group_url_v12(bot_username: str, draft_id: str) -> str:
     return f"https://t.me/{bot_username}?startgroup=tqxgrp_{draft_id}"
 
 
+_SHARE_NOTE_KEY_V13 = "share_card_note"
+_SHARE_NOTE_DEFAULT_V13 = ""
+
+
+def get_share_note_v13() -> str:
+    try:
+        return (get_setting(_SHARE_NOTE_KEY_V13, "") or "").strip()
+    except Exception:
+        return ""
+
+
+def _pad_cell_v13(text: str, width: int) -> str:
+    s = str(text)
+    if len(s) > width:
+        s = s[: width - 1] + "…"
+    return s + " " * (width - len(s))
+
+
+def _share_table_v13(rows: Sequence[Tuple[str, str]]) -> str:
+    lw = max(len(r[0]) for r in rows) + 1
+    rw = max(len(r[1]) for r in rows) + 1
+    top = "┌" + "─" * (lw + 1) + "┬" + "─" * (rw + 1) + "┐"
+    mid = "├" + "─" * (lw + 1) + "┼" + "─" * (rw + 1) + "┤"
+    bot = "└" + "─" * (lw + 1) + "┴" + "─" * (rw + 1) + "┘"
+    out = [top]
+    out.append("│ " + _pad_cell_v13("DETAIL", lw - 1) + "│ " + _pad_cell_v13("VALUE", rw - 1) + "│")
+    out.append(mid)
+    for label, value in rows:
+        out.append("│ " + _pad_cell_v13(label, lw - 1) + "│ " + _pad_cell_v13(value, rw - 1) + "│")
+    out.append(bot)
+    return "\n".join(out)
+
+
 def _share_card_html_v12(
     title: str,
     code: str,
@@ -8272,24 +8305,28 @@ def _share_card_html_v12(
     practice_url: str,
     html_url: str,
 ) -> str:
+    table = _share_table_v13(
+        [
+            ("🆔 Quiz ID", str(code)),
+            ("📚 Questions", str(q_count)),
+            ("⏱ Time / Q", f"{q_time} sec"),
+            ("➖ Negative", str(negative)),
+        ]
+    )
     lines = [
         f"🎯 <b>{base.html_escape(title)}</b>",
-        "━━━━━━━━━━━━━━━━━━",
-        f"🧾 <b>Quiz ID</b> · <code>{base.html_escape(code)}</code>",
-        f"📚 <b>Questions</b> · <b>{q_count}</b>",
-        f"⏱️ <b>Time / question</b> · <b>{q_time} sec</b>",
-        f"➖ <b>Negative / wrong</b> · <b>{negative}</b>",
-        "",
-        "🚀 <b>কীভাবে দিবে</b>",
+        f"<pre>{base.html_escape(table)}</pre>",
     ]
-    if practice_url:
-        lines.append(f'▪️ <a href="{practice_url}">এখানে ট্যাপ করে একা অনুশীলন করো</a>')
-    lines.append("▪️ গ্রুপে সবাই একসাথে দিতে নিচের বাটন ব্যবহার করো")
-    if html_url:
-        lines.append(f'▪️ <a href="{html_url}">অফলাইন HTML</a> ডাউনলোড করে ইন্টারনেট ছাড়াও দাও')
-    lines.append("")
-    lines.append("🏆 শেষে অটো রেজাল্ট ও র‍্যাংকিং পাবে।")
+    note = get_share_note_v13()
+    if note:
+        body = base.html_escape(note)
+        if practice_url:
+            body = body.replace("{practice}", practice_url).replace("{link}", practice_url)
+        if html_url:
+            body = body.replace("{offline}", html_url).replace("{html}", html_url)
+        lines.append(body)
     return "\n".join(lines)
+
 
 
 def _share_markup_v12(practice_url: str, group_url: str, html_url: str, code: str) -> Optional[InlineKeyboardMarkup]:
