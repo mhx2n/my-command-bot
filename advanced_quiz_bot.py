@@ -159,6 +159,7 @@ def apply_user_quiz_filters(user_id: Optional[int], text: str) -> str:
 
 
 QUESTION_BRAND_PREFIX = "[TQX]"
+DEFAULT_POLL_BRAND = "[ 𝕿𝖃𝕼 ]"
 
 
 def _strip_question_brand_prefix(text: str) -> str:
@@ -186,8 +187,7 @@ def get_brand_text(creator_id: Optional[int] = None) -> str:
     override = get_setting("brand_text", "").strip()
     if override:
         return override
-    default = (getattr(base.CONFIG, "brand_name", "") or "").strip()
-    return default or "Quiz"
+    return DEFAULT_POLL_BRAND
 
 
 # Expose to base namespace
@@ -2662,8 +2662,8 @@ base.send_admin_pdf_report = send_admin_pdf_report
 # robust import sanitization, HTML export, website-style result report
 # ============================================================
 
-ensure_column("drafts", "show_title_prefix", "INTEGER DEFAULT 1")
-base.DBH.execute("UPDATE drafts SET show_title_prefix=1 WHERE show_title_prefix IS NULL")
+ensure_column("drafts", "show_title_prefix", "INTEGER DEFAULT 0")
+base.DBH.execute("UPDATE drafts SET show_title_prefix=0 WHERE show_title_prefix IS NULL")
 ensure_column("drafts", "html_export_theme", "TEXT DEFAULT 'auto'")
 
 _ADV_EDIT_STATES = {
@@ -2940,9 +2940,9 @@ def _section_summary_for_draft(draft_id: str) -> List[str]:
 
 def _draft_prefix_state(draft: Any) -> bool:
     try:
-        return bool(int(draft['show_title_prefix'] or 1))
+        return bool(int(draft['show_title_prefix'] or 0))
     except Exception:
-        return True
+        return False
 
 
 def _build_draft_detail_text_markup(user_id: int, draft_id: str, page: int = 0, header: str = "", bot_username: str = "") -> Tuple[str, InlineKeyboardMarkup]:
@@ -3045,7 +3045,7 @@ def _build_draft_browser_list_text_markup(user_id: int, page: int = 0, header: s
     kb_rows: List[List[InlineKeyboardButton]] = []
     for idx, row in enumerate(page_rows, start=start + 1):
         is_active = active_id == row['id']
-        prefix = 'ON' if int(row['show_title_prefix'] or 1) else 'OFF'
+        prefix = 'ON' if int(row['show_title_prefix'] or 0) else 'OFF'
         lines.append(f"<b>{idx}. {base.html_escape(row['title'])}</b>")
         lines.append(f"Code: <code>{row['id']}</code>")
         lines.append(f"Questions: <b>{row['q_count']}</b>    Time: <b>{row['question_time']} sec</b>    Negative: <b>{row['negative_mark']}</b>")
@@ -3431,7 +3431,7 @@ async def begin_or_advance_exam(context, session_id: str) -> None:
             continue
         section_title = base.normalize_visual_text(q['section_title'] or '')
         draft_row = base.get_draft(str(session['draft_id']))
-        show_title = True if not draft_row else _draft_prefix_state(draft_row)
+        show_title = False if not draft_row else _draft_prefix_state(draft_row)
         base_seconds = int(q['question_time_override'] or session['question_time'] or 30)
         speed_factor = float(session['speed_factor'] or 1.0)
         effective_seconds = max(5, int(round(base_seconds * speed_factor)))
@@ -3886,11 +3886,11 @@ def _draft_prefix_state(draft: Any) -> bool:
     except Exception:
         raw = None
     if raw is None:
-        return True
+        return False
     try:
         return bool(int(raw))
     except Exception:
-        return True
+        return False
 
 
 def _question_preview_line(row: Any) -> str:
@@ -6440,6 +6440,10 @@ def _md(text: Any) -> str:
     return richfmt.md_escape(text) if richfmt else str(text)
 
 
+def _md_raw(text: Any):
+    return richfmt.MDRaw(str(text)) if richfmt else str(text)
+
+
 def _md_link(label: Any, url: Optional[str]):
     if not richfmt:
         return str(label)
@@ -6487,7 +6491,7 @@ def _start_card_markdown(session) -> str:
         ),
         "",
         "- [x] Answer each poll before its timer ends",
-        "- [ ] Final result will arrive as a reply to this message",
+        "- [x] Final result will arrive as a reply to this message",
         "",
         "---",
         f"_{_md(base.CONFIG.brand_name)}_",
@@ -6542,6 +6546,8 @@ _prev_send_private_results_v8 = send_private_results
 def _build_rich_result_markdown(session, rank_item, section_data, buckets_plain, meta) -> str:
     title = str(session["title"])
     parts: List[str] = [f"# {title}", ""]
+    parts.append(_md_table(["\u2726 YOUR SCORE \u2726"], [[_md_raw(f'**{meta["score"]}**')]], ["c"], 40))
+    parts.append("")
     parts.append("## Result Summary")
     parts.append("")
     parts.append(
@@ -6554,8 +6560,6 @@ def _build_rich_result_markdown(session, rank_item, section_data, buckets_plain,
                 ["Wrong", meta["wrong"]],
                 ["Skipped", meta["skipped"]],
                 ["Accuracy", meta["accuracy"]],
-                ["Percentage", meta["percentage"]],
-                ["Percentile", meta["percentile"]],
                 ["Time", meta["duration"]],
                 ["Negative / wrong", meta["negative"]],
             ],
@@ -6681,7 +6685,7 @@ async def send_private_results(context, session_id: str) -> None:  # type: ignor
             f'৻ꪆ Score: <b>{meta["score"]}</b>',
             f"◆ Correct: <b>{correct}</b>   ✕ Wrong: <b>{wrong}</b>   − Skipped: <b>{skipped}</b>",
             f'⏱ Time: <b>{duration_label}</b>',
-            f'◉ Accuracy: <b>{meta["accuracy"]}</b>   ▦ Percentage: <b>{meta["percentage"]}</b>',
+            f'◉ Accuracy: <b>{meta["accuracy"]}</b>',
             f'Negative / wrong: <b>{session["negative_mark"]}</b>',
             "",
         ]
@@ -6903,29 +6907,25 @@ def _sets_menu_text(draft_id: str) -> str:
     return "\n".join(lines)
 
 
-async def _deliver_sets(context, chat_id: int, user_id: int, draft_id: str, per_set: int) -> None:
-    try:
-        created = build_sets_from_draft(draft_id, per_set, user_id)
-    except Exception as exc:
-        with suppress(Exception):
-            await context.bot.send_message(chat_id, f"▲️ Could not build sets: {base.html_escape(str(exc))}", parse_mode=ParseMode.HTML)
-        return
-    bot_username = context.bot_data.get("bot_username", "")
-    draft = base.get_draft(draft_id)
-    exam_title = str(draft["title"]).strip() if draft else "Practice Exam"
-    q_time = int(draft["question_time"]) if draft else 0
-    negative = draft["negative_mark"] if draft else 0
-    total_q = sum(int(i["count"]) for i in created)
+_LAST_SETS_V8: Dict[int, Dict[str, Any]] = {}
+
+
+def _render_sets_message(payload: Dict[str, Any]) -> Tuple[str, str]:
+    exam_title = str(payload.get("exam_title") or "Practice Exam")
+    q_time = int(payload.get("q_time") or 0)
+    items = payload.get("items") or []
+    header = str(payload.get("header") or "").strip()
+    footer = str(payload.get("footer") or "").strip()
 
     rows = []
-    html_lines = [
-        f"<b>{base.html_escape(exam_title)} — Practice Sets</b>",
-        "",
-        f"Total questions: <b>{total_q}</b> • Sets: <b>{len(created)}</b> • {q_time} sec/question • Negative: {negative}",
-        "",
-    ]
-    for item in created:
-        url = _build_practice_url_v4(bot_username, item["draft_id"], user_id)
+    html_lines: List[str] = []
+    if header:
+        html_lines.append(f"<b>{base.html_escape(header)}</b>")
+        html_lines.append("")
+    html_lines.append(f"<b>{base.html_escape(exam_title)} — Practice Sets</b>")
+    html_lines.append("")
+    for item in items:
+        url = item.get("url") or ""
         rows.append([
             _md_link(f"Set {item['set_no']}", url),
             item["count"],
@@ -6937,34 +6937,78 @@ async def _deliver_sets(context, chat_id: int, user_id: int, draft_id: str, per_
             + f" — {item['count']} questions"
         )
 
-    markdown = "\n".join([
-        f"# {exam_title}",
-        "",
-        f"## Practice Sets ({len(created)})",
+    md_parts: List[str] = []
+    if header:
+        md_parts += [f"# {_md(header)}", ""]
+    md_parts += [
+        f"## {_md(exam_title)}",
         "",
         _md_table(["Set", "Questions", "Time / Q", "Open"], rows, ["l", "c", "c", "c"], 80),
         "",
         "## How to practice",
         "",
-        "- [ ] Tap any **Set** link above to open the exam in the bot",
-        "- [ ] Press **Start** and answer every question before its timer ends",
-        "- [ ] Finish all sets in serial order for the best preparation",
-        "- [ ] Your score, rank and full answer review arrive right after each set",
-        "",
-        f"> {total_q} questions • {q_time} sec per question • Negative {negative} per wrong answer.",
-        "",
-        "---",
-        f"_{_md(base.CONFIG.brand_name)}_",
-    ])
+        "- [x] Tap any **Set** link above to open the exam in the bot",
+        "- [x] Press **Start** and answer every question before its timer ends",
+        "- [x] Finish the sets in serial order for the best preparation",
+        "- [x] Your score, rank and full answer review arrive right after each set",
+    ]
+    if footer:
+        md_parts += ["", "---", "", _md(footer)]
+    markdown = "\n".join(md_parts)
+
     html_lines.extend([
         "",
         "<b>How to practice</b>",
-        "• Tap a set link to open the exam in the bot",
-        "• Press Start and answer each question before its timer ends",
-        "• Finish the sets in serial order",
-        "• Score, rank and full review come right after each set",
+        "✔ Tap a set link to open the exam in the bot",
+        "✔ Press Start and answer each question before its timer ends",
+        "✔ Finish the sets in serial order",
+        "✔ Score, rank and full review come right after each set",
     ])
-    await send_rich_or_html(context, chat_id, markdown, "\n".join(html_lines), plain=f"{exam_title} — practice sets")
+    if footer:
+        html_lines += ["", base.html_escape(footer)]
+    return markdown, "\n".join(html_lines)
+
+
+async def _send_sets_message(context, chat_id: int, user_id: int, payload: Dict[str, Any]) -> None:
+    markdown, html_text = _render_sets_message(payload)
+    mid = await send_rich_or_html(
+        context, chat_id, markdown, html_text, plain=f"{payload.get('exam_title')} — practice sets"
+    )
+    payload["chat_id"] = chat_id
+    payload["message_id"] = int(mid or 0)
+    _LAST_SETS_V8[int(user_id)] = payload
+    if chat_id > 0:
+      with suppress(Exception):
+        await context.bot.send_message(
+            chat_id,
+            "▤ Reply to the list above with <code>header - your text</code> or "
+            "<code>footer - your text</code> to regenerate the final list.",
+            parse_mode=ParseMode.HTML,
+        )
+
+
+async def _deliver_sets(context, chat_id: int, user_id: int, draft_id: str, per_set: int) -> None:
+    try:
+        created = build_sets_from_draft(draft_id, per_set, user_id)
+    except Exception as exc:
+        with suppress(Exception):
+            await context.bot.send_message(chat_id, f"▲️ Could not build sets: {base.html_escape(str(exc))}", parse_mode=ParseMode.HTML)
+        return
+    bot_username = context.bot_data.get("bot_username", "")
+    draft = base.get_draft(draft_id)
+    exam_title = str(draft["title"]).strip() if draft else "Practice Exam"
+    q_time = int(draft["question_time"]) if draft else 0
+    items = [
+        {
+            "set_no": item["set_no"],
+            "count": item["count"],
+            "url": _build_practice_url_v4(bot_username, item["draft_id"], user_id),
+        }
+        for item in created
+    ]
+    payload = {"exam_title": exam_title, "q_time": q_time, "items": items, "header": "", "footer": ""}
+    await _send_sets_message(context, chat_id, user_id, payload)
+
 
 
 
@@ -7036,13 +7080,97 @@ base.callback_router = _callback_router_v8
 _prev_handle_text_v8 = base.handle_text
 
 
+_HEADER_KEYS_V8 = ("header", "হ্যাডার", "হেডার", "হেডিং")
+_FOOTER_KEYS_V8 = ("footer", "ফুটার", "ফুটার লেখা")
+
+
+def _parse_header_footer_v8(text: str) -> Optional[Tuple[str, str]]:
+    raw = (text or "").strip()
+    m = re.match(r"^([^\-–—:]{1,20})\s*[\-–—:]\s*(.+)$", raw, flags=re.S)
+    if not m:
+        return None
+    key = m.group(1).strip().lower()
+    value = m.group(2).strip()
+    if not value:
+        return None
+    if key in _HEADER_KEYS_V8:
+        return "header", value
+    if key in _FOOTER_KEYS_V8:
+        return "footer", value
+    return None
+
+
+async def _stop_active_exam_v8(update: Update, context, message, user, chat) -> bool:
+    """Resilient /stoptqex: stops any live session in this chat."""
+    target_chat = user.id if chat.type == "private" else chat.id
+    if chat.type in {"group", "supergroup"}:
+        with suppress(Exception):
+            if not await base.is_group_admin_or_global(update, context):
+                await base.handle_group_denied_command(update, context)
+                return True
+    session = None
+    with suppress(Exception):
+        session = base.DBH.fetchone(
+            "SELECT * FROM sessions WHERE chat_id=? AND status NOT IN ('finished','stopped') "
+            "ORDER BY started_at DESC LIMIT 1",
+            (target_chat,),
+        )
+    if not session:
+        await base.safe_reply(
+            message,
+            "There is no active practice or exam here right now."
+            if chat.type == "private"
+            else "There is no active exam in this group.",
+        )
+        return True
+    session_id = str(session["id"])
+    with suppress(Exception):
+        for job in context.job_queue.jobs():
+            if job.name and (job.name.startswith(f"close:{session_id}") or job.name.startswith(f"advance:{session_id}")):
+                job.schedule_removal()
+    with suppress(Exception):
+        base.DBH.execute(
+            "UPDATE sessions SET status='running' WHERE id=? AND status IN ('countdown','paused')",
+            (session_id,),
+        )
+    await base.safe_reply(message, "🛑 Stopping now. Your result is on the way.")
+    with suppress(Exception):
+        await base.finish_exam(context, session_id, reason="manual_stop")
+    return True
+
+
 async def _handle_text_v8(update: Update, context) -> None:
     message = update.effective_message
     user = update.effective_user
     chat = update.effective_chat
     if not message or not user or not chat or not getattr(message, "text", None):
         return await _prev_handle_text_v8(update, context)
+
+    raw_text = str(message.text or "").strip()
+    cmd_name = ""
+    with suppress(Exception):
+        cmd_name = (base.extract_command(raw_text, context.bot_data.get("bot_username", ""))[0] or "").lower()
+    if cmd_name == "stoptqex":
+        with suppress(Exception):
+            base.record_user(user)
+            base.record_chat(chat)
+        if await _stop_active_exam_v8(update, context, message, user, chat):
+            return
+
+    reply_src = getattr(message, "reply_to_message", None)
+    stored = _LAST_SETS_V8.get(int(user.id))
+    if reply_src and stored:
+        stored_mid = int(stored.get("message_id") or 0)
+        if stored_mid <= 0 or int(getattr(reply_src, "message_id", 0) or 0) in {stored_mid, stored_mid + 1}:
+            parsed = _parse_header_footer_v8(raw_text)
+            if parsed:
+                key, value = parsed
+                stored[key] = value
+                await _send_sets_message(context, chat.id, user.id, dict(stored))
+                return
+
     state, payload = base.get_user_state(user.id)
+
     if chat.type == "private" and state == "adv8_set_size":
         raw = (message.text or "").strip()
         draft_id = str(payload.get("draft_id") or "")

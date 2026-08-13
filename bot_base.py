@@ -1659,9 +1659,12 @@ async def start_exam_countdown(context: ContextTypes.DEFAULT_TYPE, session_id: s
     current = get_session(session_id)
     if not current or current["status"] != "countdown":
         return
-    with suppress(TelegramError):
-        await context.bot.edit_message_text(chat_id=chat_id, message_id=msg.message_id, text=build_text(0, starting=True), parse_mode=ParseMode.HTML)
-    DBH.execute("UPDATE sessions SET status='running', status_message_id=? WHERE id=?", (msg.message_id, session_id))
+    # The pre-exam countdown card is removed as soon as the exam starts.
+    with suppress(TelegramError, Exception):
+        await context.bot.unpin_chat_message(chat_id=chat_id, message_id=msg.message_id)
+    with suppress(TelegramError, Exception):
+        await context.bot.delete_message(chat_id=chat_id, message_id=msg.message_id)
+    DBH.execute("UPDATE sessions SET status='running', status_message_id=NULL WHERE id=?", (session_id,))
     context.job_queue.run_once(begin_or_advance_exam_job, when=0.4, data={"session_id": session_id}, name=f"advance:{session_id}")
 
 
