@@ -9536,14 +9536,30 @@ async def _authoritative_poll_answer_v17(update: Update, context: ContextTypes.D
     session_id = "unknown"
     qrow = None
     should_advance = False
+    handled = False
     try:
         answer = update.poll_answer
         user = answer.user if answer else None
         if not answer or not user or not answer.option_ids:
             return
 
-        qrow = base.get_question_by_poll(str(answer.poll_id))
+        # Telegram may deliver PollAnswer while send_poll() is still returning
+        # and before its poll_id transaction has committed.  A one-shot lookup
+        # silently lost those fast votes, which in turn produced empty
+        # leaderboards and prevented private practice from advancing.
+        qrow = None
+        for attempt in range(8):
+            qrow = base.get_question_by_poll(str(answer.poll_id))
+            if qrow is not None:
+                break
+            if attempt < 7:
+                await asyncio.sleep(0.1)
         if not qrow or str(qrow["session_status"]) != "running":
+            base.logger.warning(
+                "Unmapped poll answer after retry: poll_id=%s user_id=%s",
+                answer.poll_id,
+                user.id,
+            )
             return
         session_id = str(qrow["session_id"])
 
@@ -9558,6 +9574,11 @@ async def _authoritative_poll_answer_v17(update: Update, context: ContextTypes.D
             display_name = base.choose_name(
                 user.username, user.first_name, user.last_name, user.id
             )
+            # record_user is deliberately outside the scoring transaction: a
+            # malformed profile must never prevent the actual vote from being
+            # counted, but known user metadata should be retained when valid.
+            with suppress(Exception):
+                base.record_user(user)
             inserted = False
             with closing(base.DBH.connect()) as conn:
                 exists = conn.execute(
@@ -9587,10 +9608,22 @@ async def _authoritative_poll_answer_v17(update: Update, context: ContextTypes.D
                     )
                     conn.commit()
                     inserted = True
+                # An existing answer is also handled: letting the legacy
+                # handler process it again cannot add value and may schedule a
+                # second private advance.  Failures before this point remain
+                # unhandled so the group=0 compatibility handler can retry.
+                handled = True
 
             # Groups keep the shared timer. A private practice belongs to
             # exactly one user, so the first answer advances immediately.
-            is_inbox = int(session["chat_id"]) == int(user.id)
+            chat_row = base.DBH.fetchone(
+                "SELECT chat_type FROM known_chats WHERE chat_id=?",
+                (int(session["chat_id"]),),
+            )
+            is_inbox = (
+                int(session["chat_id"]) == int(user.id)
+                or (chat_row is not None and str(chat_row["chat_type"]) == "private")
+            )
             should_advance = inserted and is_inbox
             if should_advance:
                 base.DBH.execute(
@@ -9612,6 +9645,13 @@ async def _authoritative_poll_answer_v17(update: Update, context: ContextTypes.D
                 base.set_session_active_poll(session_id, None, None)
                 await asyncio.sleep(0.15)
                 await base.begin_or_advance_exam(context, session_id)
+            elif inserted:
+                base.logger.info(
+                    "Recorded group participant: session=%s user=%s q=%s",
+                    session_id,
+                    user.id,
+                    qrow["q_no"],
+                )
     except Exception:
         base.logger.exception("Authoritative poll-answer flow failed for %s", session_id)
         # Once the answer was committed, a transport/UI failure must not make
@@ -9625,7 +9665,11 @@ async def _authoritative_poll_answer_v17(update: Update, context: ContextTypes.D
                     name=f"advance:{session_id}:fallback:{qrow['q_no']}",
                 )
     finally:
-        raise ApplicationHandlerStop
+        # Do not swallow an update that this compatibility layer could not
+        # record.  The canonical handler registered at group=0 remains a
+        # retry-safe fallback for lookup/status/DB failures.
+        if handled:
+            raise ApplicationHandlerStop
 
 
 _build_app_before_v17 = base.build_app
