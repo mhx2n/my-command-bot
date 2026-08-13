@@ -159,6 +159,7 @@ def apply_user_quiz_filters(user_id: Optional[int], text: str) -> str:
 
 
 QUESTION_BRAND_PREFIX = "[TQX]"
+DEFAULT_POLL_BRAND = "[ 𝝿𝞃𝞀 ]"
 
 
 def _strip_question_brand_prefix(text: str) -> str:
@@ -186,8 +187,7 @@ def get_brand_text(creator_id: Optional[int] = None) -> str:
     override = get_setting("brand_text", "").strip()
     if override:
         return override
-    default = (getattr(base.CONFIG, "brand_name", "") or "").strip()
-    return default or "Quiz"
+    return DEFAULT_POLL_BRAND
 
 
 # Expose to base namespace
@@ -2662,8 +2662,8 @@ base.send_admin_pdf_report = send_admin_pdf_report
 # robust import sanitization, HTML export, website-style result report
 # ============================================================
 
-ensure_column("drafts", "show_title_prefix", "INTEGER DEFAULT 1")
-base.DBH.execute("UPDATE drafts SET show_title_prefix=1 WHERE show_title_prefix IS NULL")
+ensure_column("drafts", "show_title_prefix", "INTEGER DEFAULT 0")
+base.DBH.execute("UPDATE drafts SET show_title_prefix=0 WHERE show_title_prefix IS NULL")
 ensure_column("drafts", "html_export_theme", "TEXT DEFAULT 'auto'")
 
 _ADV_EDIT_STATES = {
@@ -2940,9 +2940,9 @@ def _section_summary_for_draft(draft_id: str) -> List[str]:
 
 def _draft_prefix_state(draft: Any) -> bool:
     try:
-        return bool(int(draft['show_title_prefix'] or 1))
+        return bool(int(draft['show_title_prefix'] or 0))
     except Exception:
-        return True
+        return False
 
 
 def _build_draft_detail_text_markup(user_id: int, draft_id: str, page: int = 0, header: str = "", bot_username: str = "") -> Tuple[str, InlineKeyboardMarkup]:
@@ -3045,7 +3045,7 @@ def _build_draft_browser_list_text_markup(user_id: int, page: int = 0, header: s
     kb_rows: List[List[InlineKeyboardButton]] = []
     for idx, row in enumerate(page_rows, start=start + 1):
         is_active = active_id == row['id']
-        prefix = 'ON' if int(row['show_title_prefix'] or 1) else 'OFF'
+        prefix = 'ON' if int(row['show_title_prefix'] or 0) else 'OFF'
         lines.append(f"<b>{idx}. {base.html_escape(row['title'])}</b>")
         lines.append(f"Code: <code>{row['id']}</code>")
         lines.append(f"Questions: <b>{row['q_count']}</b>    Time: <b>{row['question_time']} sec</b>    Negative: <b>{row['negative_mark']}</b>")
@@ -3431,7 +3431,7 @@ async def begin_or_advance_exam(context, session_id: str) -> None:
             continue
         section_title = base.normalize_visual_text(q['section_title'] or '')
         draft_row = base.get_draft(str(session['draft_id']))
-        show_title = True if not draft_row else _draft_prefix_state(draft_row)
+        show_title = False if not draft_row else _draft_prefix_state(draft_row)
         base_seconds = int(q['question_time_override'] or session['question_time'] or 30)
         speed_factor = float(session['speed_factor'] or 1.0)
         effective_seconds = max(5, int(round(base_seconds * speed_factor)))
@@ -3886,11 +3886,11 @@ def _draft_prefix_state(draft: Any) -> bool:
     except Exception:
         raw = None
     if raw is None:
-        return True
+        return False
     try:
         return bool(int(raw))
     except Exception:
-        return True
+        return False
 
 
 def _question_preview_line(row: Any) -> str:
