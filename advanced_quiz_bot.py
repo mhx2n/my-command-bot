@@ -2683,7 +2683,8 @@ def _smart_clean_question_text(raw: str) -> str:
     value = _strip_question_brand_prefix(original)
     value = re.sub(r"/view_[A-Za-z0-9_]+", " ", value)
     value = COUNTER_RE.sub("", value)
-    value = re.sub(r"\[[^\]]{0,120}?@[^\]]+\]", " ", value)
+    # Only a pure @mention bracket is removed; every other [ ... ] stays intact.
+    value = re.sub(r"\[\s*@[A-Za-z0-9_]{3,}\s*\]", " ", value)
     value = re.sub(r"\bvia\b\s+@?[A-Za-z0-9_]+", " ", value, flags=re.I)
     value = URL_RE.sub(" ", value)
     value = USERNAME_RE.sub(" ", value)
@@ -2693,7 +2694,7 @@ def _smart_clean_question_text(raw: str) -> str:
     value = re.sub(r"[ \t]+", " ", value)
     value = re.sub(r" *\n *", "\n", value)
     value = re.sub(r"\n{3,}", "\n\n", value)
-    value = value.strip(" \t\n-–—|•[]")
+    value = value.strip(" \t\n-–—|•")
     if value:
         return value
     fallback = re.sub(r"/view_[A-Za-z0-9_]+", " ", original)
@@ -2701,7 +2702,7 @@ def _smart_clean_question_text(raw: str) -> str:
     fallback = re.sub(r"[ \t]+", " ", fallback)
     fallback = re.sub(r" *\n *", "\n", fallback)
     fallback = re.sub(r"\n{3,}", "\n\n", fallback)
-    return fallback.strip(" \t\n-–—|•[]")
+    return fallback.strip(" \t\n-–—|•")
 
 
 def _smart_clean_option_text(raw: str) -> str:
@@ -2715,7 +2716,7 @@ def _smart_clean_option_text(raw: str) -> str:
     value = URL_RE.sub(" ", value)
     value = USERNAME_RE.sub(" ", value)
     value = re.sub(r"\s+", " ", value)
-    return value.strip(" -–—|•[]")
+    return value.strip(" -–—|•")
 
 
 def _smart_clean_explanation_text(raw: str) -> str:
@@ -7350,6 +7351,525 @@ def _build_app_v8():
 base.build_app = _build_app_v8
 
 
+# ============================================================
+# Patch v9 — start-card timing, rich command tables, medal
+# scoreboard with paging, advanced Set Builder delivery
+# ============================================================
+
+import html as _html_mod
+
+_MEDALS_V9 = {1: "🥇", 2: "🥈", 3: "🥉"}
+_CARD_SENT_V9: set = set()
+
+
+# ------------------------------------------------------------
+# 1) Exam start card: exactly once, and never together with Q1
+# ------------------------------------------------------------
+
+async def _start_exam_countdown_v9(context, session_id: str, existing_message_id=None) -> None:
+    sid = str(session_id)
+    await _prev_start_countdown_v8(context, session_id, existing_message_id)
+    if sid in _CARD_SENT_V9:
+        return
+    session = None
+    with suppress(Exception):
+        session = base.get_session(session_id)
+    if not session or str(session["status"]) != "running":
+        return
+    _CARD_SENT_V9.add(sid)
+    # Hold the very first poll back so the rich card always lands first.
+    with suppress(Exception):
+        for job in context.job_queue.jobs():
+            if job.name and job.name.startswith(f"advance:{sid}"):
+                job.schedule_removal()
+    mid = 0
+    with suppress(Exception):
+        mid = await send_rich_or_html(
+            context,
+            int(session["chat_id"]),
+            _start_card_markdown(session),
+            _start_card_html(session),
+            plain=f'{session["title"]} — exam started',
+        )
+    if mid and mid > 0:
+        _START_MSG_V8[sid] = int(mid)
+        with suppress(Exception):
+            base.DBH.execute("UPDATE sessions SET status_message_id=? WHERE id=?", (int(mid), sid))
+    with suppress(Exception):
+        context.job_queue.run_once(
+            base.begin_or_advance_exam_job,
+            when=3.0,
+            data={"session_id": sid},
+            name=f"advance:{sid}",
+        )
+
+
+base.start_exam_countdown = _start_exam_countdown_v9
+
+
+# ------------------------------------------------------------
+# 2) Scoreboard — medals, clear labels, no usernames, paging
+# ------------------------------------------------------------
+
+_orig_group_text_v9 = base.build_group_result_text
+
+
+def _build_group_result_text_v9(session, ranking, *, full: bool = False) -> str:  # type: ignore[no-redef]
+    """Suppress the legacy group leaderboard while rich mode is active."""
+    if not full and rich_available():
+        raise RuntimeError("legacy group leaderboard suppressed (rich mode)")
+    return _orig_group_text_v9(session, ranking, full=full)
+
+
+base.build_group_result_text = _build_group_result_text_v9
+
+
+def _rank_rows_v9(ranking) -> List[List[Any]]:
+    rows: List[List[Any]] = []
+    for item in ranking:
+        try:
+            rank = int(item.get("rank") or 0)
+        except Exception:
+            rank = 0
+        label = _MEDALS_V9.get(rank, str(rank or "-"))
+        rows.append([
+            label,
+            str(item.get("name") or "—"),
+            item.get("score", "0"),
+            item.get("correct", 0),
+            item.get("wrong", 0),
+            item.get("skipped", 0),
+            item.get("time_label", item.get("time", "-")),
+        ])
+    return rows
+
+
+def _ranking_pages_v9(session, ranking, limit: Optional[int] = None, per_page: int = 40) -> List[Tuple[str, str]]:
+    """Return [(markdown, html)] pages so long scoreboards never get cut off."""
+    title = str(base._row_value(session, "title", "Exam") or "Exam")
+    data = list(ranking or [])
+    if limit and limit > 0:
+        data = data[:limit]
+    rows = _rank_rows_v9(data)
+    if not rows:
+        rows = [["—", "No eligible participants", "—", "—", "—", "—", "—"]]
+    chunks = [rows[i:i + per_page] for i in range(0, len(rows), per_page)] or [rows]
+    total_pages = len(chunks)
+    pages: List[Tuple[str, str]] = []
+    for index, chunk in enumerate(chunks, start=1):
+        md = [f"# {title}", ""]
+        md.append("## Final Scoreboard" + (f" — part {index}/{total_pages}" if total_pages > 1 else ""))
+        md.append("")
+        md.append(
+            _md_table(
+                ["Rank", "Name", "Score", "✔ Correct", "✘ Wrong", "− Skipped", "Time"],
+                chunk,
+                ["c", "l", "r", "c", "c", "c", "r"],
+                34,
+            )
+        )
+        md.append("")
+        if index == total_pages:
+            md.append(f"Total participants: **{len(ranking or [])}**")
+            md.append("")
+            md.append("---")
+            md.append(f"_{_md(base.CONFIG.brand_name)}_")
+        html_lines = [
+            f"<b>{base.html_escape(title)}</b>",
+            f"<b>Final Scoreboard</b>" + (f" — part {index}/{total_pages}" if total_pages > 1 else ""),
+            "",
+        ]
+        for cells in chunk:
+            html_lines.append(
+                f"{cells[0]} <b>{base.html_escape(str(cells[1]))}</b> — Score {cells[2]} | "
+                f"✔ {cells[3]}  ✘ {cells[4]}  − {cells[5]}  ⏱ {cells[6]}"
+            )
+        if index == total_pages:
+            html_lines += ["", f"Total participants: <b>{len(ranking or [])}</b>"]
+        pages.append(("\n".join(md), "\n".join(html_lines)))
+    return pages
+
+
+def _ranking_markdown(session, ranking, limit: int = 50) -> str:  # type: ignore[no-redef]
+    return "\n\n".join(md for md, _html in _ranking_pages_v9(session, ranking, limit=limit))
+
+
+async def _send_ranking_pages_v9(context, chat_id: int, session, ranking, limit=None, reply_to=None) -> None:
+    pages = _ranking_pages_v9(session, ranking, limit=limit)
+    for index, (md, html_text) in enumerate(pages):
+        with suppress(Exception):
+            await send_rich_or_html(
+                context,
+                chat_id,
+                md,
+                html_text[:3800],
+                plain="Final scoreboard",
+                reply_to=reply_to if index == 0 else None,
+            )
+
+
+async def _rich_send_admin_text_results_v9(context, session, ranking):  # type: ignore[no-redef]
+    with suppress(Exception):
+        chat_id_val = int(session.get("chat_id") if isinstance(session, dict) else session["chat_id"])
+        if chat_id_val > 0:
+            return
+    if not rich_available():
+        return await _prev_send_admin_text_results_v8(context, session, ranking)
+    recipients: List[int] = []
+    creator_id = int(base._row_value(session, "created_by", 0) or 0)
+    for uid in [creator_id] + list(base.CONFIG.owner_ids) + base.all_admin_ids():
+        if uid and uid not in recipients:
+            recipients.append(uid)
+    for uid in recipients:
+        await _send_ranking_pages_v9(context, uid, session, ranking)
+
+
+base.send_admin_text_results = _rich_send_admin_text_results_v9
+
+
+async def _finish_exam_v9(context, session_id: str, reason: str = "completed") -> None:
+    session = None
+    with suppress(Exception):
+        session = base.get_session(session_id)
+    chat_id = int(session["chat_id"]) if session else 0
+    await _prev_finish_exam_v8(context, session_id, reason)
+    try:
+        if rich_available() and session and chat_id < 0:
+            ranking = base.get_session_ranking(session_id)
+            await _send_ranking_pages_v9(
+                context,
+                chat_id,
+                session,
+                ranking,
+                limit=None,
+                reply_to=_session_start_message_id(session),
+            )
+    except Exception:
+        base.logger.warning("Rich group scoreboard failed for %s", session_id, exc_info=True)
+    _START_MSG_V8.pop(str(session_id), None)
+    _CARD_SENT_V9.discard(str(session_id))
+
+
+base.finish_exam = _finish_exam_v9
+
+
+# ------------------------------------------------------------
+# 3) Rich command tables (user / admin / owner panels)
+# ------------------------------------------------------------
+
+def _commands_rich_markdown(chat_type: str, is_admin_user: bool, is_owner_user: bool) -> Tuple[str, str]:
+    html_text = build_commands_text(chat_type, is_admin_user, is_owner_user)
+    sections: List[Tuple[str, List[List[str]]]] = []
+    current_title = "Commands"
+    current_rows: List[List[str]] = []
+    notes: List[str] = []
+    for raw_line in html_text.splitlines():
+        line = _html_mod.unescape(re.sub(r"<[^>]+>", "", raw_line)).strip()
+        if not line:
+            continue
+        low = line.lower()
+        if low.startswith("command list"):
+            continue
+        if line.startswith("•"):
+            body = line[1:].strip()
+            parts = re.split(r"\s+[—–-]\s+", body, maxsplit=1)
+            current_rows.append([parts[0].strip(), (parts[1].strip() if len(parts) > 1 else "")])
+            continue
+        if current_rows:
+            sections.append((current_title, current_rows))
+            current_rows = []
+        if "prefix" in low and len(line) < 120 and not current_rows:
+            notes.append(line)
+            continue
+        current_title = line
+    if current_rows:
+        sections.append((current_title, current_rows))
+
+    md: List[str] = ["# Command List", ""]
+    for note in notes:
+        md += [f"_{_md(note)}_", ""]
+    for title, rows in sections:
+        md.append(f"## {_md(title)}")
+        md.append("")
+        md.append(_md_table(["Command", "What it does"], rows, ["l", "l"], 90))
+        md.append("")
+    md.append("---")
+    md.append(f"_{_md(base.CONFIG.brand_name)}_")
+    return "\n".join(md), html_text
+
+
+async def _cmd_commands_v9(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    user = update.effective_user
+    chat = update.effective_chat
+    if not message or not user or not chat:
+        return
+    is_admin_u = False
+    is_owner_u = False
+    with suppress(Exception):
+        is_admin_u = base.is_bot_admin(user.id)
+        is_owner_u = base.is_owner(user.id)
+    md, html_text = _commands_rich_markdown(chat.type, is_admin_u, is_owner_u)
+    with suppress(Exception):
+        await send_rich_or_html(
+            context,
+            chat.id,
+            md,
+            html_text[:3900],
+            plain="Command list",
+            reply_to=int(getattr(message, "message_id", 0) or 0) or None,
+        )
+    raise ApplicationHandlerStop
+
+
+# ------------------------------------------------------------
+# 4) Set Builder — offline HTML link, header+footer, channel post
+# ------------------------------------------------------------
+
+def _offline_html_url_v9(bot_username: str, draft_id: str) -> str:
+    if not bot_username or not draft_id:
+        return ""
+    return f"https://t.me/{bot_username}?start=tqxhtml_{draft_id}"
+
+
+def _render_sets_message(payload: Dict[str, Any]) -> Tuple[str, str]:  # type: ignore[no-redef]
+    exam_title = str(payload.get("exam_title") or "Practice Exam")
+    items = payload.get("items") or []
+    header = str(payload.get("header") or "").strip()
+    footer = str(payload.get("footer") or "").strip()
+
+    rows = []
+    html_lines: List[str] = []
+    if header:
+        html_lines += [f"<b>{base.html_escape(header)}</b>", ""]
+    html_lines += [f"<b>{base.html_escape(exam_title)}</b>", ""]
+    for item in items:
+        url = item.get("url") or ""
+        html_url = item.get("html_url") or ""
+        rows.append([
+            _md_link(f"Set {item['set_no']}", url),
+            _md_link("Start", url),
+            _md_link("Offline", html_url) if html_url else "—",
+        ])
+        line = f'<b><a href="{url}">Set {item["set_no"]}</a></b>' if url else f"<b>Set {item['set_no']}</b>"
+        if html_url:
+            line += f' — <a href="{html_url}">offline HTML</a>'
+        html_lines.append(line)
+
+    md_parts: List[str] = []
+    if header:
+        md_parts += [f"# {_md(header)}", ""]
+    md_parts += [
+        f"## {_md(exam_title)}",
+        "",
+        _md_table(["Set", "Exam", "Offline"], rows, ["l", "c", "c"], 80),
+        "",
+        "## যেভাবে পরীক্ষা দিবে",
+        "",
+        "- [x] **Set** লিংকে ক্লিক করলেই বটে পরীক্ষা শুরু হবে",
+        "- [x] প্রতিটি প্রশ্নের নির্দিষ্ট সময়ের ভেতরেই উত্তর দিতে হবে",
+        "- [x] সেট সিরিয়াল অনুযায়ী এক এক করে শেষ করবে",
+        "- [x] **Offline** লিংকে HTML ফাইল পাবে — ইন্টারনেট ছাড়াও অনুশীলন করা যাবে",
+        "- [x] পরীক্ষা শেষ হলেই স্কোর, র‍্যাংক ও সম্পূর্ণ উত্তরপত্র পাবে",
+    ]
+    if footer:
+        md_parts += ["", "---", "", _md(footer)]
+    markdown = "\n".join(md_parts)
+
+    html_lines += [
+        "",
+        "<b>যেভাবে পরীক্ষা দিবে</b>",
+        "✅ Set লিংকে ক্লিক করলেই বটে পরীক্ষা শুরু হবে",
+        "✅ প্রতিটি প্রশ্নের নির্দিষ্ট সময়ের ভেতরে উত্তর দিতে হবে",
+        "✅ সেট সিরিয়াল অনুযায়ী এক এক করে শেষ করবে",
+        "✅ Offline লিংকে HTML ফাইল পাবে",
+        "✅ শেষ হলেই স্কোর, র‍্যাংক ও সম্পূর্ণ উত্তরপত্র পাবে",
+    ]
+    if footer:
+        html_lines += ["", base.html_escape(footer)]
+    return markdown, "\n".join(html_lines)
+
+
+async def _send_sets_message(context, chat_id: int, user_id: int, payload: Dict[str, Any]) -> None:  # type: ignore[no-redef]
+    markdown, html_text = _render_sets_message(payload)
+    mid = await send_rich_or_html(
+        context, chat_id, markdown, html_text, plain=f"{payload.get('exam_title')} — practice sets"
+    )
+    payload["chat_id"] = chat_id
+    payload["message_id"] = int(mid or 0)
+    _LAST_SETS_V8[int(user_id)] = payload
+    if chat_id > 0:
+        with suppress(Exception):
+            await context.bot.send_message(
+                chat_id,
+                "▤ এই লিস্টটিকে <b>reply</b> করে পাঠাতে পারো:\n"
+                "• <code>header - your text</code>\n"
+                "• <code>footer - your text</code>\n"
+                "• একসাথে দুই লাইনে header ও footer দুটোই\n"
+                "• কোনো চ্যানেল পোস্টের লিংক দিলে ঐ পোস্টে reply করে লিস্টটি সেই চ্যানেলে পাঠানো হবে",
+                parse_mode=ParseMode.HTML,
+            )
+
+
+async def _deliver_sets(context, chat_id: int, user_id: int, draft_id: str, per_set: int) -> None:  # type: ignore[no-redef]
+    try:
+        created = build_sets_from_draft(draft_id, per_set, user_id)
+    except Exception as exc:
+        with suppress(Exception):
+            await context.bot.send_message(
+                chat_id, f"▲️ Could not build sets: {base.html_escape(str(exc))}", parse_mode=ParseMode.HTML
+            )
+        return
+    bot_username = context.bot_data.get("bot_username", "")
+    draft = base.get_draft(draft_id)
+    exam_title = str(draft["title"]).strip() if draft else "Practice Exam"
+    q_time = int(draft["question_time"]) if draft else 0
+    items = [
+        {
+            "set_no": item["set_no"],
+            "count": item["count"],
+            "draft_id": item["draft_id"],
+            "url": _build_practice_url_v4(bot_username, item["draft_id"], user_id),
+            "html_url": _offline_html_url_v9(bot_username, item["draft_id"]),
+        }
+        for item in created
+    ]
+    payload = {"exam_title": exam_title, "q_time": q_time, "items": items, "header": "", "footer": ""}
+    await _send_sets_message(context, chat_id, user_id, payload)
+
+
+def _parse_header_footer_v9(text: str) -> Dict[str, str]:
+    """Accept header and footer together, one per line, in any order."""
+    updates: Dict[str, str] = {}
+    current: Optional[str] = None
+    for raw_line in str(text or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        m = re.match(r"^([^\-–—:]{1,20})\s*[\-–—:]\s*(.*)$", line)
+        key = m.group(1).strip().lower() if m else ""
+        if m and key in _HEADER_KEYS_V8:
+            current = "header"
+            updates["header"] = m.group(2).strip()
+        elif m and key in _FOOTER_KEYS_V8:
+            current = "footer"
+            updates["footer"] = m.group(2).strip()
+        elif current:
+            updates[current] = (updates.get(current, "") + "\n" + line).strip()
+    return {k: v for k, v in updates.items() if v}
+
+
+_CHANNEL_POST_RE_V9 = re.compile(r"https?://t\.me/(c/(\d+)|[A-Za-z0-9_]{4,})/(\d+)")
+
+
+async def _resolve_channel_target_v9(context, text: str) -> Optional[Tuple[int, int]]:
+    m = _CHANNEL_POST_RE_V9.search(text or "")
+    if not m:
+        return None
+    msg_id = int(m.group(3))
+    if m.group(2):
+        return int(f"-100{m.group(2)}"), msg_id
+    username = m.group(1)
+    with suppress(Exception):
+        chat = await context.bot.get_chat(f"@{username}")
+        return int(chat.id), msg_id
+    return None
+
+
+_prev_handle_text_v9 = base.handle_text
+
+
+async def _handle_text_v9(update: Update, context) -> None:
+    message = update.effective_message
+    user = update.effective_user
+    chat = update.effective_chat
+    if not message or not user or not chat or not getattr(message, "text", None):
+        return await _prev_handle_text_v9(update, context)
+    raw_text = str(message.text or "").strip()
+    reply_src = getattr(message, "reply_to_message", None)
+    stored = _LAST_SETS_V8.get(int(user.id))
+    if reply_src and stored and raw_text:
+        stored_mid = int(stored.get("message_id") or 0)
+        replied_mid = int(getattr(reply_src, "message_id", 0) or 0)
+        if stored_mid <= 0 or replied_mid in {stored_mid, stored_mid + 1}:
+            target = await _resolve_channel_target_v9(context, raw_text)
+            if target:
+                chat_id, post_id = target
+                markdown, html_text = _render_sets_message(stored)
+                sent = 0
+                with suppress(Exception):
+                    sent = await send_rich_or_html(
+                        context,
+                        chat_id,
+                        markdown,
+                        html_text,
+                        plain=f"{stored.get('exam_title')} — practice sets",
+                        reply_to=post_id,
+                    )
+                await base.safe_reply(
+                    message,
+                    "◆ চ্যানেলে পাঠানো হয়েছে।" if sent else "▲️ চ্যানেলে পাঠানো যায়নি — বট ঐ চ্যানেলে অ্যাডমিন কিনা দেখো।",
+                )
+                return
+            updates = _parse_header_footer_v9(raw_text)
+            if updates:
+                stored.update(updates)
+                await _send_sets_message(context, chat.id, user.id, dict(stored))
+                return
+    return await _prev_handle_text_v9(update, context)
+
+
+base.handle_text = _handle_text_v9
+
+
+# ------------------------------------------------------------
+# 5) Offline HTML deep link + handler registration
+# ------------------------------------------------------------
+
+async def _cmd_start_offline_html_v9(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    user = update.effective_user
+    if not message or not user:
+        return
+    args = list(getattr(context, "args", None) or [])
+    payload = str(args[0]) if args else ""
+    if not payload.startswith("tqxhtml_"):
+        return
+    draft_id = payload[len("tqxhtml_"):].strip()
+    draft = None
+    with suppress(Exception):
+        draft = base.get_draft(draft_id)
+    if not draft:
+        await base.safe_reply(message, "▲️ এই অফলাইন পরীক্ষাটি আর পাওয়া যাচ্ছে না।")
+        raise ApplicationHandlerStop
+    try:
+        html_doc = render_scroll_exam_html(draft, int(draft["owner_id"]))
+        await context.bot.send_document(
+            user.id,
+            document=InputFile(
+                base.io.BytesIO(html_doc.encode("utf-8")),
+                filename=f"{base.pdf_safe_filename(draft['title'])}_offline.html",
+            ),
+            caption="▤ অফলাইন HTML পরীক্ষা — ডাউনলোড করে ইন্টারনেট ছাড়াই অনুশীলন করো।",
+        )
+    except Exception as exc:
+        await base.safe_reply(message, f"▲️ HTML তৈরি করা যায়নি: {base.html_escape(str(exc))}")
+    raise ApplicationHandlerStop
+
+
+_orig_build_app_v9 = base.build_app
+
+
+def _build_app_v9():
+    app = _orig_build_app_v9()
+    with suppress(Exception):
+        from telegram.ext import CommandHandler as _CH9
+        app.add_handler(_CH9("start", _cmd_start_offline_html_v9), group=-160)
+        app.add_handler(_CH9(["help", "commands", "cmds"], _cmd_commands_v9), group=-150)
+    return app
+
+
+base.build_app = _build_app_v9
 
 
 if __name__ == "__main__":
