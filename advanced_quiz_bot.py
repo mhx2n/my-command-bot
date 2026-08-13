@@ -9462,6 +9462,15 @@ async def _stop_exam_command_v16(update: Update, context: ContextTypes.DEFAULT_T
                     base.logger.info("Could not close poll while stopping %s: %s", session_id, exc)
             # Normalize before finalization so countdown and paused sessions
             # produce the same partial result as a running session.
+            if chat.type == "private":
+                # finish_exam determines the delivery format from known_chats.
+                # Seed it here as well so stopping before the first answer still
+                # produces the personal result and HTML report.
+                base.DBH.execute(
+                    "INSERT INTO known_chats(chat_id,title,username,chat_type,active,last_seen) VALUES(?,?,?,?,1,?) "
+                    "ON CONFLICT(chat_id) DO UPDATE SET chat_type='private',active=1,last_seen=excluded.last_seen",
+                    (user.id, user.full_name or str(user.id), user.username, "private", base.now_ts()),
+                )
             base.DBH.execute("UPDATE sessions SET status='running' WHERE id=?", (session_id,))
             await base.finish_exam(context, session_id, reason="manual_stop")
     except Exception:
