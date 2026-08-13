@@ -8253,10 +8253,172 @@ async def _finish_exam_v11(context, session_id: str, reason: str = "completed") 
     _CARD_SENT_V9.discard(sid)
     await _prev_finish_exam_v11(context, session_id, reason)
 
+# ============================================================
+# Patch v12 — professional share card (inline mode) + group start
+# ============================================================
 
-base.finish_exam = _finish_exam_v11
+def _share_group_url_v12(bot_username: str, draft_id: str) -> str:
+    if not bot_username or not draft_id:
+        return ""
+    return f"https://t.me/{bot_username}?startgroup=tqxgrp_{draft_id}"
+
+
+def _share_card_html_v12(
+    title: str,
+    code: str,
+    q_count: int,
+    q_time: int,
+    negative: Any,
+    practice_url: str,
+    html_url: str,
+) -> str:
+    lines = [
+        f"🎯 <b>{base.html_escape(title)}</b>",
+        "━━━━━━━━━━━━━━━━━━",
+        f"🧾 <b>Quiz ID</b> · <code>{base.html_escape(code)}</code>",
+        f"📚 <b>Questions</b> · <b>{q_count}</b>",
+        f"⏱️ <b>Time / question</b> · <b>{q_time} sec</b>",
+        f"➖ <b>Negative / wrong</b> · <b>{negative}</b>",
+        "",
+        "🚀 <b>কীভাবে দিবে</b>",
+    ]
+    if practice_url:
+        lines.append(f'▪️ <a href="{practice_url}">এখানে ট্যাপ করে একা অনুশীলন করো</a>')
+    lines.append("▪️ গ্রুপে সবাই একসাথে দিতে নিচের বাটন ব্যবহার করো")
+    if html_url:
+        lines.append(f'▪️ <a href="{html_url}">অফলাইন HTML</a> ডাউনলোড করে ইন্টারনেট ছাড়াও দাও')
+    lines.append("")
+    lines.append("🏆 শেষে অটো রেজাল্ট ও র‍্যাংকিং পাবে।")
+    return "\n".join(lines)
+
+
+def _share_markup_v12(practice_url: str, group_url: str, html_url: str, code: str) -> Optional[InlineKeyboardMarkup]:
+    rows: List[List[InlineKeyboardButton]] = []
+    if practice_url:
+        rows.append([InlineKeyboardButton("▶️ Start this quiz", url=practice_url)])
+    if group_url:
+        rows.append([InlineKeyboardButton("👥 Start quiz in group", url=group_url)])
+    if html_url:
+        rows.append([InlineKeyboardButton("📥 Offline HTML", url=html_url)])
+    rows.append([InlineKeyboardButton("🔗 Share quiz", switch_inline_query=code)])
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
+async def handle_inline_query(update: Update, context) -> None:  # type: ignore[no-redef]
+    iq = update.inline_query
+    if not iq or not iq.from_user:
+        return
+    user_id = iq.from_user.id
+    if not base.user_has_staff_access(user_id):
+        with suppress(Exception):
+            await iq.answer([], cache_time=0, is_personal=True)
+        return
+    query = base.normalize_visual_text(iq.query or "")
+    drafts = base.list_user_drafts(user_id)
+    bot_username = context.bot_data.get("bot_username", "")
+    results: List[InlineQueryResultArticle] = []
+    for row in drafts[:20]:
+        q_count = int(row.get("q_count", 0) if isinstance(row, dict) else row["q_count"])
+        if q_count <= 0:
+            continue
+        title = str(row["title"])
+        code = str(row["id"])
+        q_lower = query.casefold()
+        if query and not (q_lower in code.casefold() or q_lower in title.casefold() or q_lower in f"quiz:{code.casefold()}"):
+            continue
+        practice_url = _build_practice_url_v4(bot_username, code, int(row["owner_id"])) if bot_username else ""
+        html_url = _offline_html_url_v9(bot_username, code)
+        group_url = _share_group_url_v12(bot_username, code)
+        text = _share_card_html_v12(
+            title, code, q_count, int(row["question_time"]), row["negative_mark"], practice_url or "", html_url
+        )
+        results.append(
+            InlineQueryResultArticle(
+                id=code,
+                title=f"🎯 {title}",
+                description=f"📚 {q_count} questions • ⏱️ {row['question_time']} sec • ➖ {row['negative_mark']}",
+                input_message_content=InputTextMessageContent(
+                    text, parse_mode=ParseMode.HTML, disable_web_page_preview=True
+                ),
+                reply_markup=_share_markup_v12(practice_url or "", group_url, html_url, code),
+            )
+        )
+    with suppress(Exception):
+        await iq.answer(results, cache_time=0, is_personal=True)
+
+
+async def _cmd_start_group_quiz_v12(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle the ?startgroup=tqxgrp_<CODE> deep link inside a group."""
+    message = update.effective_message
+    user = update.effective_user
+    chat = update.effective_chat
+    if not message or not user or not chat:
+        return
+    args = list(getattr(context, "args", None) or [])
+    payload = str(args[0]) if args else ""
+    if not payload.startswith("tqxgrp_"):
+        return
+    if chat.type not in {"group", "supergroup"}:
+        raise ApplicationHandlerStop
+    draft_id = payload[len("tqxgrp_"):].strip().upper()
+    base.record_user(user)
+    base.record_chat(chat)
+    draft = None
+    with suppress(Exception):
+        draft = base.get_draft(draft_id)
+    if not draft:
+        await base.safe_reply(message, "▲️ এই কুইজটি আর পাওয়া যাচ্ছে না।")
+        raise ApplicationHandlerStop
+    if not await base.is_group_admin_or_global(update, context):
+        await base.handle_group_denied_command(update, context)
+        raise ApplicationHandlerStop
+    if base.get_active_session(chat.id):
+        await base.safe_reply(message, "এই গ্রুপে এখন একটি পরীক্ষা চলছে।")
+        raise ApplicationHandlerStop
+    qrow = base.DBH.fetchone("SELECT COUNT(*) AS c FROM draft_questions WHERE draft_id=?", (draft["id"],))
+    q_count = int(qrow["c"] if qrow else 0)
+    if q_count <= 0:
+        await base.safe_reply(message, "এই কুইজে কোনো প্রশ্ন নেই।")
+        raise ApplicationHandlerStop
+    with suppress(Exception):
+        base.bind_draft_to_group(str(draft["id"]), chat.id, user.id)
+    store = context.application.bot_data.setdefault("ready_starts", {})
+    old_state = store.get(chat.id) or {}
+    old_mid = int(old_state.get("message_id") or 0)
+    if old_mid:
+        with suppress(Exception):
+            await context.bot.delete_message(chat_id=chat.id, message_id=old_mid)
+    state = {
+        "draft_id": draft["id"],
+        "requested_by": user.id,
+        "title": draft["title"],
+        "question_time": int(draft["question_time"]),
+        "negative_mark": float(draft["negative_mark"]),
+        "questions": q_count,
+        "users": [],
+        "message_id": None,
+    }
+    store[chat.id] = state
+    await _render_lobby_v11(context, chat.id, state, 0)
+    raise ApplicationHandlerStop
+
+
+_orig_build_app_v12 = base.build_app
+
+
+def _build_app_v12():
+    app = _orig_build_app_v12()
+    with suppress(Exception):
+        from telegram.ext import CommandHandler as _CH12
+
+        app.add_handler(_CH12("start", _cmd_start_group_quiz_v12), group=-170)
+    return app
+
+
+base.build_app = _build_app_v12
 
 
 if __name__ == "__main__":
     base.main()
+
 
