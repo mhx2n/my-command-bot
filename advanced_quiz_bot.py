@@ -9592,10 +9592,16 @@ async def _authoritative_poll_answer_v17(update: Update, context: ContextTypes.D
     try:
         answer = update.poll_answer
         user = answer.user if answer else None
-        if not answer or not user or not answer.option_ids:
-            if answer and not user:
-                base.logger.warning("Poll answer has no user and cannot be ranked: poll_id=%s", answer.poll_id)
+        voter_chat = getattr(answer, "voter_chat", None) if answer else None
+        voter = user or voter_chat
+        if not answer or not voter or not answer.option_ids:
+            if answer and not voter:
+                base.logger.warning("Poll answer has no voter identity: poll_id=%s", answer.poll_id)
             return
+        voter_id = int(voter.id)
+        voter_username = getattr(voter, "username", None)
+        voter_first_name = getattr(voter, "first_name", None) or getattr(voter, "title", None)
+        voter_last_name = getattr(voter, "last_name", None)
 
         # Telegram may deliver PollAnswer while send_poll() is still returning
         # and before its poll_id transaction has committed.  A one-shot lookup
@@ -9628,7 +9634,7 @@ async def _authoritative_poll_answer_v17(update: Update, context: ContextTypes.D
             base.logger.warning(
                 "Unmapped poll answer after retry: poll_id=%s user_id=%s",
                 answer.poll_id,
-                user.id,
+                voter_id,
             )
             return
         session_id = str(qrow["session_id"])
@@ -9645,19 +9651,21 @@ async def _authoritative_poll_answer_v17(update: Update, context: ContextTypes.D
             correct = selected == int(qrow["correct_option"])
             negative = _safe_negative_mark_v17(qrow["negative_mark"])
             display_name = base.choose_name(
-                user.username, user.first_name, user.last_name, user.id
+                voter_username, voter_first_name, voter_last_name, voter_id
             )
             # record_user is deliberately outside the scoring transaction: a
             # malformed profile must never prevent the actual vote from being
             # counted, but known user metadata should be retained when valid.
             with suppress(Exception):
+                if user is None:
+                    raise ValueError("chat voters are not Telegram users")
                 base.record_user(user)
             inserted = False
             answered_at = base.now_ts()
             with closing(base.DBH.connect()) as conn:
                 cursor = conn.execute(
                     "INSERT OR IGNORE INTO answers(session_id,q_no,user_id,selected_option,is_correct,answered_at) VALUES(?,?,?,?,?,?)",
-                    (session_id, qrow["q_no"], user.id, selected, 1 if correct else 0, answered_at),
+                    (session_id, qrow["q_no"], voter_id, selected, 1 if correct else 0, answered_at),
                 )
                 inserted = cursor.rowcount == 1
                 # Rebuild this participant's totals from the authoritative
@@ -9671,7 +9679,7 @@ async def _authoritative_poll_answer_v17(update: Update, context: ContextTypes.D
                            COALESCE(MAX(answered_at),0) AS last_answer
                     FROM answers WHERE session_id=? AND user_id=?
                     """,
-                    (session_id, user.id),
+                    (session_id, voter_id),
                 ).fetchone()
                 correct_count = int(totals["correct"] or 0)
                 wrong_count = max(0, int(totals["answered"] or 0) - correct_count)
@@ -9690,7 +9698,7 @@ async def _authoritative_poll_answer_v17(update: Update, context: ContextTypes.D
                       last_answer_at=excluded.last_answer_at
                     """,
                     (
-                        session_id, user.id, user.username, display_name,
+                        session_id, voter_id, voter_username, display_name,
                         correct_count, wrong_count, score,
                         int(totals["last_answer"] or answered_at),
                     ),
@@ -9709,9 +9717,12 @@ async def _authoritative_poll_answer_v17(update: Update, context: ContextTypes.D
                 (int(session["chat_id"]),),
             )
             is_inbox = (
-                int(session["chat_id"]) == int(user.id)
-                or int(session["chat_id"]) > 0
-                or (chat_row is not None and str(chat_row["chat_type"]) == "private")
+                user is not None
+                and (
+                    int(session["chat_id"]) == int(user.id)
+                    or int(session["chat_id"]) > 0
+                    or (chat_row is not None and str(chat_row["chat_type"]) == "private")
+                )
             )
             should_advance = inserted and is_inbox
             if should_advance:
@@ -9748,7 +9759,7 @@ async def _authoritative_poll_answer_v17(update: Update, context: ContextTypes.D
                 base.logger.info(
                     "Recorded group participant: session=%s user=%s q=%s",
                     session_id,
-                    user.id,
+                    voter_id,
                     qrow["q_no"],
                 )
     except Exception:
