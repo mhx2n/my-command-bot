@@ -7872,8 +7872,127 @@ def _build_app_v9():
     return app
 
 
-base.build_app = _build_app_v9
+
+
+# ============================================================
+# Patch v10 — single exam-start card + inline reverse countdown
+# ============================================================
+
+_COUNTDOWN_LOCK_V10: set = set()
+
+
+def _countdown_text_v10(remaining: int, total: int) -> str:
+    total = max(1, int(total))
+    remaining = max(0, int(remaining))
+    if remaining <= 0:
+        return "<b>🚀 GO!</b>"
+    done = max(0, total - remaining)
+    bar = "▰" * done + "▱" * remaining
+    return f"<b>⟡ EXAM STARTS IN</b>\n<b>{bar}  {remaining:02d}</b>"
+
+
+async def _start_exam_countdown_v10(context, session_id: str, existing_message_id=None) -> None:
+    sid = str(session_id)
+    if sid in _COUNTDOWN_LOCK_V10:
+        return
+    _COUNTDOWN_LOCK_V10.add(sid)
+    try:
+        session = None
+        with suppress(Exception):
+            session = base.get_session(sid)
+        if not session:
+            return
+        chat_id = int(session["chat_id"])
+
+        # The legacy pre-exam info card is never kept.
+        if existing_message_id:
+            with suppress(Exception):
+                await context.bot.delete_message(chat_id=chat_id, message_id=int(existing_message_id))
+
+        # 1) Rich start card — exactly once per session.
+        if sid not in _CARD_SENT_V9:
+            _CARD_SENT_V9.add(sid)
+            mid = 0
+            with suppress(Exception):
+                mid = await send_rich_or_html(
+                    context,
+                    chat_id,
+                    _start_card_markdown(session),
+                    _start_card_html(session),
+                    plain=f'{session["title"]} — exam started',
+                )
+            if mid and mid > 0:
+                _START_MSG_V8[sid] = int(mid)
+                with suppress(Exception):
+                    base.DBH.execute("UPDATE sessions SET status_message_id=? WHERE id=?", (int(mid), sid))
+
+        # 2) One small message that counts down in place, then disappears.
+        total = max(3, int(getattr(base.CONFIG, "countdown_seconds", 5) or 5))
+        tick_msg = None
+        with suppress(Exception):
+            tick_msg = await context.bot.send_message(
+                chat_id, _countdown_text_v10(total, total), parse_mode=ParseMode.HTML
+            )
+        if tick_msg:
+            with suppress(Exception):
+                base.mark_session_countdown_message(sid, tick_msg.message_id)
+        for sec in range(total - 1, -1, -1):
+            await base.asyncio.sleep(1)
+            current = None
+            with suppress(Exception):
+                current = base.get_session(sid)
+            if not current or str(current["status"]) not in {"countdown", "running"}:
+                if tick_msg:
+                    with suppress(Exception):
+                        await context.bot.delete_message(chat_id=chat_id, message_id=tick_msg.message_id)
+                return
+            if tick_msg:
+                with suppress(Exception):
+                    await context.bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=tick_msg.message_id,
+                        text=_countdown_text_v10(sec, total),
+                        parse_mode=ParseMode.HTML,
+                    )
+        await base.asyncio.sleep(0.6)
+        if tick_msg:
+            with suppress(Exception):
+                await context.bot.delete_message(chat_id=chat_id, message_id=tick_msg.message_id)
+
+        # 3) Start the polls.
+        with suppress(Exception):
+            base.DBH.execute(
+                "UPDATE sessions SET status='running' WHERE id=? AND status IN ('countdown','running')", (sid,)
+            )
+        with suppress(Exception):
+            for job in context.job_queue.jobs():
+                if job.name and job.name.startswith(f"advance:{sid}"):
+                    job.schedule_removal()
+        with suppress(Exception):
+            context.job_queue.run_once(
+                base.begin_or_advance_exam_job,
+                when=0.5,
+                data={"session_id": sid},
+                name=f"advance:{sid}",
+            )
+    finally:
+        _COUNTDOWN_LOCK_V10.discard(sid)
+
+
+base.start_exam_countdown = _start_exam_countdown_v10
+
+
+_prev_finish_exam_v10 = base.finish_exam
+
+
+async def _finish_exam_v10(context, session_id: str, reason: str = "completed") -> None:
+    _COUNTDOWN_LOCK_V10.discard(str(session_id))
+    await _prev_finish_exam_v10(context, session_id, reason)
+
+
+base.finish_exam = _finish_exam_v10
 
 
 if __name__ == "__main__":
     base.main()
+
