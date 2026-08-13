@@ -7433,11 +7433,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 ("stopped", now_ts(), session["id"]),
             )
         _spawn_background(context, _finish_exam_background(context, session["id"], reason="manual_stop"))
-        if chat.type == "private":
-            await safe_reply(message, "🛑 Stop requested. Final results are being prepared in the background.")
-        else:
-            await safe_reply(message, "🛑 Stop requested. Final results are being prepared in the background.")
+        if chat.type != "private":
             await safe_delete_message(context.bot, chat.id, message.message_id)
+
         return
 
     return await _previous_handle_text_multi(update, context)
