@@ -8504,7 +8504,9 @@ def _build_app_v12():
         from telegram.ext import CommandHandler as _CH12
 
         app.add_handler(_CH12("start", _cmd_start_group_quiz_v12), group=-170)
+        app.add_handler(_CH12("sharenote", cmd_sharenote_v13), group=-170)
     return app
+
 
 
 base.build_app = _build_app_v12
