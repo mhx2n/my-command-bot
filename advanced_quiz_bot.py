@@ -9656,10 +9656,9 @@ async def _authoritative_poll_answer_v17(update: Update, context: ContextTypes.D
             # record_user is deliberately outside the scoring transaction: a
             # malformed profile must never prevent the actual vote from being
             # counted, but known user metadata should be retained when valid.
-            with suppress(Exception):
-                if user is None:
-                    raise ValueError("chat voters are not Telegram users")
-                base.record_user(user)
+            if user is not None:
+                with suppress(Exception):
+                    base.record_user(user)
             inserted = False
             answered_at = base.now_ts()
             with closing(base.DBH.connect()) as conn:
