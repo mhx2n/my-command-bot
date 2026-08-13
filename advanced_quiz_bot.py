@@ -9551,6 +9551,8 @@ async def _authoritative_poll_answer_v17(update: Update, context: ContextTypes.D
         answer = update.poll_answer
         user = answer.user if answer else None
         if not answer or not user or not answer.option_ids:
+            if answer and not user:
+                base.logger.warning("Poll answer has no user and cannot be ranked: poll_id=%s", answer.poll_id)
             return
 
         # Telegram may deliver PollAnswer while send_poll() is still returning
@@ -9558,7 +9560,7 @@ async def _authoritative_poll_answer_v17(update: Update, context: ContextTypes.D
         # silently lost those fast votes, which in turn produced empty
         # leaderboards and prevented private practice from advancing.
         qrow = None
-        for attempt in range(8):
+        for attempt in range(30):
             qrow = base.get_question_by_poll(str(answer.poll_id))
             if qrow is None:
                 # Compatibility with restored/older databases where the poll
@@ -9578,7 +9580,7 @@ async def _authoritative_poll_answer_v17(update: Update, context: ContextTypes.D
                 )
             if qrow is not None:
                 break
-            if attempt < 7:
+            if attempt < 29:
                 await asyncio.sleep(0.1)
         if not qrow or str(qrow["session_status"]) != "running":
             base.logger.warning(
@@ -9589,7 +9591,10 @@ async def _authoritative_poll_answer_v17(update: Update, context: ContextTypes.D
             return
         session_id = str(qrow["session_id"])
 
-        async with base._operation_lock(context, f"private-exam:{session_id}"):
+        # Serialize writes per session for both group and inbox exams. The old
+        # private-only lock allowed simultaneous group votes to contend on
+        # SQLite and occasionally lose the participant update.
+        async with base._operation_lock(context, f"exam-answer:{session_id}"):
             session = base.get_session(session_id)
             if not session or str(session["status"]) != "running":
                 return
@@ -9606,34 +9611,49 @@ async def _authoritative_poll_answer_v17(update: Update, context: ContextTypes.D
             with suppress(Exception):
                 base.record_user(user)
             inserted = False
+            answered_at = base.now_ts()
             with closing(base.DBH.connect()) as conn:
-                exists = conn.execute(
-                    "SELECT 1 FROM answers WHERE session_id=? AND q_no=? AND user_id=?",
-                    (session_id, qrow["q_no"], user.id),
+                cursor = conn.execute(
+                    "INSERT OR IGNORE INTO answers(session_id,q_no,user_id,selected_option,is_correct,answered_at) VALUES(?,?,?,?,?,?)",
+                    (session_id, qrow["q_no"], user.id, selected, 1 if correct else 0, answered_at),
+                )
+                inserted = cursor.rowcount == 1
+                # Rebuild this participant's totals from the authoritative
+                # answers table. This is idempotent and also repairs rows left
+                # incomplete by an older handler or a previous interrupted
+                # transaction.
+                totals = conn.execute(
+                    """
+                    SELECT COUNT(*) AS answered,
+                           COALESCE(SUM(is_correct),0) AS correct,
+                           COALESCE(MAX(answered_at),0) AS last_answer
+                    FROM answers WHERE session_id=? AND user_id=?
+                    """,
+                    (session_id, user.id),
                 ).fetchone()
-                if not exists:
-                    conn.execute(
-                        "INSERT INTO answers(session_id,q_no,user_id,selected_option,is_correct,answered_at) VALUES(?,?,?,?,?,?)",
-                        (session_id, qrow["q_no"], user.id, selected, 1 if correct else 0, base.now_ts()),
-                    )
-                    conn.execute(
-                        """
-                        INSERT INTO participants(session_id,user_id,username,display_name,eligible,correct_count,wrong_count,score,last_answer_at)
-                        VALUES(?,?,?,?,1,?,?,?,?)
-                        ON CONFLICT(session_id,user_id) DO UPDATE SET
-                          username=excluded.username, display_name=excluded.display_name, eligible=1,
-                          correct_count=participants.correct_count+excluded.correct_count,
-                          wrong_count=participants.wrong_count+excluded.wrong_count,
-                          score=participants.score+excluded.score, last_answer_at=excluded.last_answer_at
-                        """,
-                        (
-                            session_id, user.id, user.username, display_name,
-                            1 if correct else 0, 0 if correct else 1,
-                            1.0 if correct else -negative, base.now_ts(),
-                        ),
-                    )
-                    conn.commit()
-                    inserted = True
+                correct_count = int(totals["correct"] or 0)
+                wrong_count = max(0, int(totals["answered"] or 0) - correct_count)
+                score = float(correct_count) - (float(wrong_count) * negative)
+                conn.execute(
+                    """
+                    INSERT INTO participants(session_id,user_id,username,display_name,eligible,correct_count,wrong_count,score,last_answer_at)
+                    VALUES(?,?,?,?,1,?,?,?,?)
+                    ON CONFLICT(session_id,user_id) DO UPDATE SET
+                      username=excluded.username,
+                      display_name=excluded.display_name,
+                      eligible=1,
+                      correct_count=excluded.correct_count,
+                      wrong_count=excluded.wrong_count,
+                      score=excluded.score,
+                      last_answer_at=excluded.last_answer_at
+                    """,
+                    (
+                        session_id, user.id, user.username, display_name,
+                        correct_count, wrong_count, score,
+                        int(totals["last_answer"] or answered_at),
+                    ),
+                )
+                conn.commit()
                 # An existing answer is also handled: letting the legacy
                 # handler process it again cannot add value and may schedule a
                 # second private advance.  Failures before this point remain
