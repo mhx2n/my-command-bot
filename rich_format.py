@@ -201,11 +201,11 @@ async def send_rich(
         markup = _convert_markup(reply_markup)
         if markup is not None:
             kwargs["reply_markup"] = markup
-        try:
-            result = await client(functions.messages.SendMessageRequest(**kwargs))  # type: ignore[union-attr]
-        except Exception:
-            kwargs.pop("reply_to", None)
-            result = await client(functions.messages.SendMessageRequest(**kwargs))  # type: ignore[union-attr]
+        # Never retry a send blindly.  A transient timeout can happen after
+        # Telegram has already accepted the first request; retrying the same
+        # SendMessageRequest then creates two identical rich cards.  Callers
+        # can fall back on a later user action instead of duplicating output.
+        result = await client(functions.messages.SendMessageRequest(**kwargs))  # type: ignore[union-attr]
         return _extract_message_id(result)
     except Exception as exc:
         logger.info("Rich send failed for %s: %s", chat_id, exc)
