@@ -2694,7 +2694,7 @@ def _smart_clean_question_text(raw: str) -> str:
     value = re.sub(r"[ \t]+", " ", value)
     value = re.sub(r" *\n *", "\n", value)
     value = re.sub(r"\n{3,}", "\n\n", value)
-    value = value.strip(" \t\n-–—|•[]")
+    value = value.strip(" \t\n-–—|•")
     if value:
         return value
     fallback = re.sub(r"/view_[A-Za-z0-9_]+", " ", original)
@@ -2702,7 +2702,7 @@ def _smart_clean_question_text(raw: str) -> str:
     fallback = re.sub(r"[ \t]+", " ", fallback)
     fallback = re.sub(r" *\n *", "\n", fallback)
     fallback = re.sub(r"\n{3,}", "\n\n", fallback)
-    return fallback.strip(" \t\n-–—|•[]")
+    return fallback.strip(" \t\n-–—|•")
 
 
 def _smart_clean_option_text(raw: str) -> str:
@@ -2716,7 +2716,7 @@ def _smart_clean_option_text(raw: str) -> str:
     value = URL_RE.sub(" ", value)
     value = USERNAME_RE.sub(" ", value)
     value = re.sub(r"\s+", " ", value)
-    return value.strip(" -–—|•[]")
+    return value.strip(" -–—|•")
 
 
 def _smart_clean_explanation_text(raw: str) -> str:
