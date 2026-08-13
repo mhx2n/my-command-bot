@@ -6907,29 +6907,25 @@ def _sets_menu_text(draft_id: str) -> str:
     return "\n".join(lines)
 
 
-async def _deliver_sets(context, chat_id: int, user_id: int, draft_id: str, per_set: int) -> None:
-    try:
-        created = build_sets_from_draft(draft_id, per_set, user_id)
-    except Exception as exc:
-        with suppress(Exception):
-            await context.bot.send_message(chat_id, f"▲️ Could not build sets: {base.html_escape(str(exc))}", parse_mode=ParseMode.HTML)
-        return
-    bot_username = context.bot_data.get("bot_username", "")
-    draft = base.get_draft(draft_id)
-    exam_title = str(draft["title"]).strip() if draft else "Practice Exam"
-    q_time = int(draft["question_time"]) if draft else 0
-    negative = draft["negative_mark"] if draft else 0
-    total_q = sum(int(i["count"]) for i in created)
+_LAST_SETS_V8: Dict[int, Dict[str, Any]] = {}
+
+
+def _render_sets_message(payload: Dict[str, Any]) -> Tuple[str, str]:
+    exam_title = str(payload.get("exam_title") or "Practice Exam")
+    q_time = int(payload.get("q_time") or 0)
+    items = payload.get("items") or []
+    header = str(payload.get("header") or "").strip()
+    footer = str(payload.get("footer") or "").strip()
 
     rows = []
-    html_lines = [
-        f"<b>{base.html_escape(exam_title)} — Practice Sets</b>",
-        "",
-        f"Total questions: <b>{total_q}</b> • Sets: <b>{len(created)}</b> • {q_time} sec/question • Negative: {negative}",
-        "",
-    ]
-    for item in created:
-        url = _build_practice_url_v4(bot_username, item["draft_id"], user_id)
+    html_lines: List[str] = []
+    if header:
+        html_lines.append(f"<b>{base.html_escape(header)}</b>")
+        html_lines.append("")
+    html_lines.append(f"<b>{base.html_escape(exam_title)} — Practice Sets</b>")
+    html_lines.append("")
+    for item in items:
+        url = item.get("url") or ""
         rows.append([
             _md_link(f"Set {item['set_no']}", url),
             item["count"],
@@ -6941,34 +6937,77 @@ async def _deliver_sets(context, chat_id: int, user_id: int, draft_id: str, per_
             + f" — {item['count']} questions"
         )
 
-    markdown = "\n".join([
-        f"# {exam_title}",
-        "",
-        f"## Practice Sets ({len(created)})",
+    md_parts: List[str] = []
+    if header:
+        md_parts += [f"# {_md(header)}", ""]
+    md_parts += [
+        f"## {_md(exam_title)}",
         "",
         _md_table(["Set", "Questions", "Time / Q", "Open"], rows, ["l", "c", "c", "c"], 80),
         "",
         "## How to practice",
         "",
-        "- [ ] Tap any **Set** link above to open the exam in the bot",
-        "- [ ] Press **Start** and answer every question before its timer ends",
-        "- [ ] Finish all sets in serial order for the best preparation",
-        "- [ ] Your score, rank and full answer review arrive right after each set",
-        "",
-        f"> {total_q} questions • {q_time} sec per question • Negative {negative} per wrong answer.",
-        "",
-        "---",
-        f"_{_md(base.CONFIG.brand_name)}_",
-    ])
+        "- [x] Tap any **Set** link above to open the exam in the bot",
+        "- [x] Press **Start** and answer every question before its timer ends",
+        "- [x] Finish the sets in serial order for the best preparation",
+        "- [x] Your score, rank and full answer review arrive right after each set",
+    ]
+    if footer:
+        md_parts += ["", "---", "", _md(footer)]
+    markdown = "\n".join(md_parts)
+
     html_lines.extend([
         "",
         "<b>How to practice</b>",
-        "• Tap a set link to open the exam in the bot",
-        "• Press Start and answer each question before its timer ends",
-        "• Finish the sets in serial order",
-        "• Score, rank and full review come right after each set",
+        "✔ Tap a set link to open the exam in the bot",
+        "✔ Press Start and answer each question before its timer ends",
+        "✔ Finish the sets in serial order",
+        "✔ Score, rank and full review come right after each set",
     ])
-    await send_rich_or_html(context, chat_id, markdown, "\n".join(html_lines), plain=f"{exam_title} — practice sets")
+    if footer:
+        html_lines += ["", base.html_escape(footer)]
+    return markdown, "\n".join(html_lines)
+
+
+async def _send_sets_message(context, chat_id: int, user_id: int, payload: Dict[str, Any]) -> None:
+    markdown, html_text = _render_sets_message(payload)
+    mid = await send_rich_or_html(
+        context, chat_id, markdown, html_text, plain=f"{payload.get('exam_title')} — practice sets"
+    )
+    payload["chat_id"] = chat_id
+    payload["message_id"] = int(mid or 0)
+    _LAST_SETS_V8[int(user_id)] = payload
+    with suppress(Exception):
+        await context.bot.send_message(
+            chat_id,
+            "▤ Reply to the list above with <code>header - your text</code> or "
+            "<code>footer - your text</code> to regenerate the final list.",
+            parse_mode=ParseMode.HTML,
+        )
+
+
+async def _deliver_sets(context, chat_id: int, user_id: int, draft_id: str, per_set: int) -> None:
+    try:
+        created = build_sets_from_draft(draft_id, per_set, user_id)
+    except Exception as exc:
+        with suppress(Exception):
+            await context.bot.send_message(chat_id, f"▲️ Could not build sets: {base.html_escape(str(exc))}", parse_mode=ParseMode.HTML)
+        return
+    bot_username = context.bot_data.get("bot_username", "")
+    draft = base.get_draft(draft_id)
+    exam_title = str(draft["title"]).strip() if draft else "Practice Exam"
+    q_time = int(draft["question_time"]) if draft else 0
+    items = [
+        {
+            "set_no": item["set_no"],
+            "count": item["count"],
+            "url": _build_practice_url_v4(bot_username, item["draft_id"], user_id),
+        }
+        for item in created
+    ]
+    payload = {"exam_title": exam_title, "q_time": q_time, "items": items, "header": "", "footer": ""}
+    await _send_sets_message(context, chat_id, user_id, payload)
+
 
 
 
