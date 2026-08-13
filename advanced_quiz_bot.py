@@ -6487,7 +6487,7 @@ def _start_card_markdown(session) -> str:
         ),
         "",
         "- [x] Answer each poll before its timer ends",
-        "- [ ] Final result will arrive as a reply to this message",
+        "- [x] Final result will arrive as a reply to this message",
         "",
         "---",
         f"_{_md(base.CONFIG.brand_name)}_",
@@ -6542,6 +6542,8 @@ _prev_send_private_results_v8 = send_private_results
 def _build_rich_result_markdown(session, rank_item, section_data, buckets_plain, meta) -> str:
     title = str(session["title"])
     parts: List[str] = [f"# {title}", ""]
+    parts.append(_md_table(["\u2726 YOUR SCORE"], [[f'**{meta["score"]}**']], ["c"], 40))
+    parts.append("")
     parts.append("## Result Summary")
     parts.append("")
     parts.append(
@@ -6554,8 +6556,6 @@ def _build_rich_result_markdown(session, rank_item, section_data, buckets_plain,
                 ["Wrong", meta["wrong"]],
                 ["Skipped", meta["skipped"]],
                 ["Accuracy", meta["accuracy"]],
-                ["Percentage", meta["percentage"]],
-                ["Percentile", meta["percentile"]],
                 ["Time", meta["duration"]],
                 ["Negative / wrong", meta["negative"]],
             ],
@@ -6681,7 +6681,7 @@ async def send_private_results(context, session_id: str) -> None:  # type: ignor
             f'৻ꪆ Score: <b>{meta["score"]}</b>',
             f"◆ Correct: <b>{correct}</b>   ✕ Wrong: <b>{wrong}</b>   − Skipped: <b>{skipped}</b>",
             f'⏱ Time: <b>{duration_label}</b>',
-            f'◉ Accuracy: <b>{meta["accuracy"]}</b>   ▦ Percentage: <b>{meta["percentage"]}</b>',
+            f'◉ Accuracy: <b>{meta["accuracy"]}</b>',
             f'Negative / wrong: <b>{session["negative_mark"]}</b>',
             "",
         ]
