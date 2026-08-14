@@ -9480,26 +9480,25 @@ def render_scroll_exam_html(draft: Any, owner_id: int) -> str:  # type: ignore[n
 # ============================================================
 
 def _deepen_hex_v20(hex_color: str) -> str:
+    """Return a deep, vivid version of the accent (same hue, richer + darker)."""
+    import colorsys
+
     raw = (hex_color or '').strip().lstrip('#')
     if len(raw) == 3:
         raw = ''.join(c * 2 for c in raw)
     if len(raw) != 6:
-        return '#0f7a3d'
+        return '#0b7a3b'
     try:
-        r, g, b = (int(raw[i:i + 2], 16) for i in (0, 2, 4))
+        r, g, b = (int(raw[i:i + 2], 16) / 255.0 for i in (0, 2, 4))
     except ValueError:
-        return '#0f7a3d'
-    # Darken until the colour is deep enough for white text on it.
-    for _ in range(40):
-        lum = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0
-        if lum <= 0.30:
-            break
-        r, g, b = (int(r * 0.90), int(g * 0.90), int(b * 0.90))
-    # Keep it vivid, never muddy grey.
-    mx = max(r, g, b, 1)
-    boost = min(1.35, 190.0 / mx) if mx < 140 else 1.0
-    r, g, b = (min(255, int(r * boost)), min(255, int(g * boost)), min(255, int(b * boost)))
-    return '#%02x%02x%02x' % (r, g, b)
+        return '#0b7a3b'
+    h, l, s = colorsys.rgb_to_hls(r, g, b)
+    if s < 0.12:  # near-grey accent -> fall back to a deep emerald
+        return '#0b7a3b'
+    s = max(s, 0.78)
+    l = min(l, 0.30)
+    r, g, b = colorsys.hls_to_rgb(h, l, s)
+    return '#%02x%02x%02x' % (round(r * 255), round(g * 255), round(b * 255))
 
 
 _orig_export_theme_palette_v20 = _export_theme_palette
