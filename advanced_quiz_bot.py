@@ -7299,7 +7299,18 @@ def export_backup_payload_v8() -> Dict[str, Any]:
         "tables": {},
     }
     with closing(base.DBH.connect()) as conn:
-        for table in BACKUP_TABLES_V8:
+        # Include every application table, including tables introduced by
+        # later patches.  Keeping only a hand-maintained list previously made
+        # newly-added question metadata silently disappear from backups.
+        discovered = [
+            str(r[0])
+            for r in conn.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+            ).fetchall()
+        ]
+        tables_to_export = list(dict.fromkeys(BACKUP_TABLES_V8 + discovered))
+        for table in tables_to_export:
             if not _table_exists_v8(conn, table):
                 continue
             rows = conn.execute(f"SELECT * FROM {table}").fetchall()
