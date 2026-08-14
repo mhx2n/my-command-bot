@@ -3177,12 +3177,18 @@ def promote_scientific_notation(text: Any) -> str:
     value = str(text or "")
     if not value:
         return value
-    value = _SUP_TAG_RE.sub(lambda m: _map_script(m.group(1), _TO_SUPER), value)
-    value = _SUB_TAG_RE.sub(lambda m: _map_script(m.group(1), _TO_SUB), value)
-    value = _SUP_BRACE_RE.sub(lambda m: _map_script(m.group(1), _TO_SUPER), value)
-    value = _SUB_BRACE_RE.sub(lambda m: _map_script(m.group(1), _TO_SUB), value)
-    value = _SUP_SHORT_RE.sub(lambda m: _map_script(m.group(1), _TO_SUPER), value)
-    value = _SUB_SHORT_RE.sub(lambda m: _map_script(m.group(1), _TO_SUB), value)
+    def _rep(table):
+        def inner(m: "re.Match[str]") -> str:
+            mapped = _map_script(m.group(1), table)
+            return mapped if mapped != m.group(1).strip() else m.group(0)
+        return inner
+
+    value = _SUP_TAG_RE.sub(_rep(_TO_SUPER), value)
+    value = _SUB_TAG_RE.sub(_rep(_TO_SUB), value)
+    value = _SUP_BRACE_RE.sub(_rep(_TO_SUPER), value)
+    value = _SUB_BRACE_RE.sub(_rep(_TO_SUB), value)
+    value = _SUP_SHORT_RE.sub(_rep(_TO_SUPER), value)
+    value = _SUB_SHORT_RE.sub(_rep(_TO_SUB), value)
     return value
 
 
