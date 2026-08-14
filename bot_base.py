@@ -3163,11 +3163,13 @@ _SUB_SHORT_RE = re.compile(r"(?<=[A-Za-z0-9\)\]])_(-?[0-9]{1,3})")
 
 
 def _map_script(raw: str, table: dict) -> str:
-    converted = raw.translate(table)
-    # only accept a full conversion, otherwise keep the original text intact
-    return converted if not any(c in raw for c in converted) or all(
-        ch.translate(table) != ch or not ch.strip() for ch in raw
-    ) else raw
+    raw = str(raw or "").strip()
+    if not raw:
+        return raw
+    # convert only when every character has a script counterpart
+    if all(ord(ch) in table for ch in raw):
+        return raw.translate(table)
+    return raw
 
 
 def promote_scientific_notation(text: Any) -> str:
