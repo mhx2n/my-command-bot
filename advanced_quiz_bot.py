@@ -10101,6 +10101,349 @@ def render_scroll_exam_html(draft: Any, owner_id: int) -> str:  # type: ignore[n
     html = html.replace("</style>", _brand_dark_css_v22() + "</style>", 1)
     return html
 
+# ============================================================
+# Patch v23 — Dual storage: GitHub + MongoDB
+#   * /backupnow writes to BOTH destinations (manual only)
+#   * restore merges BOTH destinations back into SQLite
+#   * boot auto-restore works from whichever is available
+#   * /dbstatus — owner dashboard (users, data, storage health)
+# ============================================================
+
+try:
+    import mongo_store as _mongo_v23  # type: ignore
+except Exception:  # pragma: no cover
+    _mongo_v23 = None  # type: ignore
+
+
+def _mongo_ready_v23() -> bool:
+    return bool(_mongo_v23 and _mongo_v23.configured())
+
+
+_gh_only_ready_v23 = _gh_ready_v14
+
+
+def _gh_ready_v23() -> bool:
+    """Any configured backup destination counts as 'ready'."""
+    return bool(_gh_only_ready_v23() or _mongo_ready_v23())
+
+
+_gh_ready_v14 = _gh_ready_v23  # type: ignore[assignment]
+
+
+def _keyed_tables_v23(tables: Dict[str, Any]) -> Dict[str, List[Tuple[str, Dict[str, Any]]]]:
+    keyed: Dict[str, List[Tuple[str, Dict[str, Any]]]] = {}
+    if not isinstance(tables, dict):
+        return keyed
+    with closing(base.DBH.connect()) as conn:
+        for table, rows in tables.items():
+            if not isinstance(rows, list):
+                continue
+            pks = _pk_cols_v15(conn, table)
+            pairs: List[Tuple[str, Dict[str, Any]]] = []
+            for row in rows:
+                if isinstance(row, dict):
+                    pairs.append((_row_key_v15(row, pks), row))
+            if pairs:
+                keyed[table] = pairs
+    return keyed
+
+
+def _mongo_push_v23(tables: Dict[str, Any], stamp: str) -> Dict[str, Any]:
+    if not _mongo_ready_v23():
+        return {"ok": False, "rows": 0, "tables": 0, "error": "not configured"}
+    try:
+        res = _mongo_v23.push_tables(_keyed_tables_v23(tables))
+        with suppress(Exception):
+            _mongo_v23.save_snapshot(stamp, tables)
+        return res
+    except Exception as exc:
+        base.logger.exception("Mongo backup failed")
+        return {"ok": False, "rows": 0, "tables": 0, "error": str(exc)}
+
+
+def _backup_now_v23() -> Dict[str, Any]:
+    """Manual backup to GitHub *and* MongoDB. Cumulative on both sides."""
+    local = export_backup_payload_v8()
+    local_tables = local.get("tables") or {}
+    stamp = _dt_v14.now().strftime("%Y%m%d-%H%M%S")
+
+    info: Dict[str, Any] = {
+        "rows": _count_rows_v15(local_tables),
+        "new_rows": _count_rows_v15(local_tables),
+        "tables": len(local_tables),
+        "main_size": 0,
+        "snapshot_path": "",
+        "snapshot_size": 0,
+        "github_ok": False,
+        "github_error": "",
+    }
+
+    if _gh_only_ready_v23():
+        try:
+            gh = _backup_now_v15()
+            info.update(gh)
+            info["github_ok"] = True
+            info["github_error"] = ""
+        except Exception as exc:
+            info["github_error"] = str(exc)
+            base.logger.exception("GitHub backup failed")
+
+    mres = _mongo_push_v23(local_tables, stamp)
+    info["mongo_ok"] = bool(mres.get("ok"))
+    info["mongo_rows"] = int(mres.get("rows") or 0)
+    info["mongo_tables"] = int(mres.get("tables") or 0)
+    info["mongo_error"] = str(mres.get("error") or "")
+    return info
+
+
+def _restore_everything_v23() -> Tuple[bool, int]:
+    """Merge GitHub main + GitHub snapshots + MongoDB, then write to SQLite."""
+    tables: Dict[str, List[Dict[str, Any]]] = {}
+    if _gh_only_ready_v23():
+        with suppress(Exception):
+            main = _download_payload_v15(base.GITHUB_STATE_PATH)
+            tables = _merge_tables_v15(tables, main.get("tables") if isinstance(main, dict) else {})
+        for snap in sorted(_gh_list_dir_v14(_snapshot_dir_v14()), key=lambda x: x["name"]):
+            with suppress(Exception):
+                data = _download_payload_v15(snap["path"])
+                tables = _merge_tables_v15(tables, data.get("tables") if isinstance(data, dict) else {})
+    if _mongo_ready_v23():
+        with suppress(Exception):
+            tables = _merge_tables_v15(tables, _mongo_v23.load_tables())
+    restored = _apply_tables_v15(tables)
+    base.logger.info("Dual-store restore complete: %s rows", restored)
+    return restored > 0, restored
+
+
+def _restore_from_path_v23(path: str) -> Tuple[bool, int]:
+    if path and path.startswith("mongo://"):
+        data = _mongo_v23.load_snapshot(path.split("://", 1)[1]) if _mongo_ready_v23() else {}
+        if not isinstance(data, dict) or not data:
+            return False, 0
+        tables = data.get("tables") if isinstance(data.get("tables"), dict) else data
+        restored = _apply_tables_v15(tables)
+        return restored > 0, restored
+    if not path or path == base.GITHUB_STATE_PATH:
+        return _restore_everything_v23()
+    return _restore_from_path_v15(path)
+
+
+# Re-point the vault handlers at the dual-store implementations.
+_backup_now_v14 = _backup_now_v23  # type: ignore[assignment]
+_restore_from_path_v14 = _restore_from_path_v23  # type: ignore[assignment]
+_restore_everything_v15 = _restore_everything_v23  # type: ignore[assignment]
+
+
+def _auto_restore_on_boot_v23() -> None:
+    if not (_gh_only_ready_v23() or _mongo_ready_v23()):
+        return
+    if not _db_is_empty_v15():
+        return
+    with suppress(Exception):
+        ok, rows = _restore_everything_v23()
+        if ok:
+            base.logger.info("Boot restore: %s rows recovered (GitHub + MongoDB).", rows)
+
+
+# ------------------------------------------------------------
+# Owner dashboard
+# ------------------------------------------------------------
+
+_DASH_TABLES_V23 = [
+    ("known_users", "👥 Users"),
+    ("known_chats", "💬 Groups"),
+    ("bot_admins", "🛡 Admins"),
+    ("drafts", "📚 Exams / drafts"),
+    ("draft_questions", "❓ Questions"),
+    ("draft_sections", "🧩 Sections"),
+    ("practice_links", "🔗 Practice links"),
+    ("practice_attempts", "📝 Practice attempts"),
+    ("sessions", "🎯 Exam sessions"),
+    ("participants", "🙋 Participants"),
+    ("answers", "✅ Answers"),
+    ("schedules", "⏰ Schedules"),
+    ("bot_settings", "⚙️ Owner settings"),
+]
+
+
+def _db_counts_v23() -> List[Tuple[str, int]]:
+    out: List[Tuple[str, int]] = []
+    with closing(base.DBH.connect()) as conn:
+        for table, label in _DASH_TABLES_V23:
+            if not _table_exists_v8(conn, table):
+                continue
+            try:
+                row = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
+                out.append((label, int(row[0] or 0)))
+            except Exception:
+                continue
+    return out
+
+
+def _dashboard_text_v23() -> str:
+    counts = _db_counts_v23()
+    lines = ["📊 <b>Owner Dashboard</b>", ""]
+    lines.append("<b>Live database</b>")
+    for label, n in counts:
+        lines.append(f"• {base.html_escape(label)}: <b>{n}</b>")
+
+    lines.append("")
+    lines.append("<b>Storage — GitHub</b>")
+    if _gh_only_ready_v23():
+        inv = {"total": 0, "snapshots": [], "db_size": 0}
+        with suppress(Exception):
+            inv = _backup_inventory_v14()
+        lines.append(f"• Repo: <code>{base.html_escape(str(base.GITHUB_REPO))}</code>")
+        lines.append(f"• File: <code>{base.html_escape(str(base.GITHUB_STATE_PATH))}</code>")
+        lines.append(f"• Snapshots: <b>{len(inv.get('snapshots') or [])}</b>")
+        lines.append(f"• Space used: <b>{_fmt_bytes_v14(inv.get('total'))}</b>")
+    else:
+        lines.append("• ❌ not configured (GITHUB_TOKEN / GITHUB_REPO)")
+
+    lines.append("")
+    lines.append("<b>Storage — MongoDB</b>")
+    if _mongo_ready_v23():
+        st = _mongo_v23.stats()
+        state = "✅ connected" if st.get("connected") else "❌ unreachable"
+        lines.append(f"• Status: {state}")
+        lines.append(f"• Database: <code>{base.html_escape(str(st.get('db')))}</code>")
+        lines.append(f"• Backed-up rows: <b>{st.get('rows')}</b> in {st.get('tables')} collections")
+        lines.append(f"• Snapshots: <b>{st.get('snapshots')}</b>")
+        lines.append(f"• Space used: <b>{_fmt_bytes_v14(st.get('storage'))}</b>")
+        ts = int(st.get("last_backup") or 0)
+        if ts:
+            lines.append(f"• Last backup: <code>{_dt_v14.fromtimestamp(ts):%Y-%m-%d %H:%M}</code>")
+        if st.get("error"):
+            lines.append(f"• ⚠️ {base.html_escape(str(st.get('error'))[:180])}")
+    else:
+        lines.append("• ❌ not configured (MONGODB_URI)")
+
+    lines.append("")
+    lines.append("Use /backupnow to save, /backups to restore.")
+    return "\n".join(lines)
+
+
+async def cmd_dbstatus_v23(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    user = update.effective_user
+    if not message or not user:
+        return
+    if not base.is_owner(user.id):
+        await base.safe_reply(message, "Only the bot owner can view the dashboard.")
+        raise ApplicationHandlerStop
+    notice = await message.reply_text("⏳ Collecting…")
+    try:
+        text = await asyncio.get_event_loop().run_in_executor(None, _dashboard_text_v23)
+        await notice.edit_text(text, parse_mode=ParseMode.HTML)
+    except Exception as exc:
+        await notice.edit_text(
+            f"❌ Dashboard error: <code>{base.html_escape(str(exc))}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+    raise ApplicationHandlerStop
+
+
+async def cmd_backupnow_v23(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    user = update.effective_user
+    if not message or not user:
+        return
+    if not base.is_owner(user.id):
+        await base.safe_reply(message, "Only the bot owner can trigger backups.")
+        raise ApplicationHandlerStop
+    if not (_gh_only_ready_v23() or _mongo_ready_v23()):
+        await message.reply_text(
+            "❌ No backup destination configured.\n"
+            "Set <code>GITHUB_TOKEN</code> + <code>GITHUB_REPO</code> and/or "
+            "<code>MONGODB_URI</code>, then redeploy.",
+            parse_mode=ParseMode.HTML,
+        )
+        raise ApplicationHandlerStop
+    notice = await message.reply_text("⏳ Backing up to GitHub + MongoDB…")
+    loop = asyncio.get_event_loop()
+    try:
+        info = await loop.run_in_executor(None, _backup_now_v23)
+        with suppress(Exception):
+            inv = await loop.run_in_executor(None, _backup_inventory_v14)
+            _BACKUP_CACHE_V14[user.id] = inv["snapshots"]
+
+        gh_line = (
+            f"✅ <code>{base.html_escape(str(base.GITHUB_STATE_PATH))}</code> "
+            f"({_fmt_bytes_v14(info.get('main_size'))})"
+            if info.get("github_ok")
+            else ("❌ " + base.html_escape(str(info.get("github_error") or "not configured"))[:160])
+        )
+        mongo_line = (
+            f"✅ {info.get('mongo_rows')} rows → {info.get('mongo_tables')} collections"
+            if info.get("mongo_ok")
+            else ("❌ " + base.html_escape(str(info.get("mongo_error") or "not configured"))[:160])
+        )
+        text = (
+            "✅ <b>Backup complete</b>\n\n"
+            f"<b>Rows saved:</b> {info.get('new_rows')} in {info.get('tables')} tables\n\n"
+            f"<b>GitHub:</b> {gh_line}\n"
+            f"<b>MongoDB:</b> {mongo_line}\n\n"
+            "Everything is cumulative — old backups are never deleted.\n"
+            "Use /backups to restore, /dbstatus for the dashboard."
+        )
+        await notice.edit_text(text, parse_mode=ParseMode.HTML)
+    except Exception as exc:
+        base.logger.exception("Backup v23 failed")
+        await notice.edit_text(
+            f"❌ Backup error: <code>{base.html_escape(str(exc))}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+    raise ApplicationHandlerStop
+
+
+async def cmd_restorebackup_v23(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    user = update.effective_user
+    if not message or not user:
+        return
+    if not base.is_owner(user.id):
+        await base.safe_reply(message, "Only the bot owner can restore backups.")
+        raise ApplicationHandlerStop
+    notice = await message.reply_text("⏳ Restoring from GitHub + MongoDB…")
+    try:
+        ok, rows = await asyncio.get_event_loop().run_in_executor(None, _restore_everything_v23)
+        if ok:
+            await notice.edit_text(
+                "✅ <b>Restore complete</b>\n\n"
+                f"<b>Rows restored:</b> {rows}\n"
+                "<b>Sources:</b> GitHub backup + MongoDB mirror",
+                parse_mode=ParseMode.HTML,
+            )
+        else:
+            await notice.edit_text("⚠️ Nothing to restore — both destinations are empty.")
+    except Exception as exc:
+        base.logger.exception("Restore v23 failed")
+        await notice.edit_text(
+            f"❌ Restore error: <code>{base.html_escape(str(exc))}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+    raise ApplicationHandlerStop
+
+
+_orig_build_app_v23 = base.build_app
+
+
+def _build_app_v23():
+    app = _orig_build_app_v23()
+    with suppress(Exception):
+        from telegram.ext import CommandHandler as _CH23
+
+        app.add_handler(_CH23("backupnow", cmd_backupnow_v23), group=-600)
+        app.add_handler(_CH23(["restorebackup", "restoreall"], cmd_restorebackup_v23), group=-600)
+        app.add_handler(_CH23(["dbstatus", "dashboard", "storage"], cmd_dbstatus_v23), group=-600)
+    with suppress(Exception):
+        _auto_restore_on_boot_v23()
+    return app
+
+
+base.build_app = _build_app_v23
+
 
 if __name__ == "__main__":
     base.main()
+
