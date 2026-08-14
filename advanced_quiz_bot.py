@@ -9400,6 +9400,84 @@ def render_scroll_exam_html(draft: Any, owner_id: int) -> str:  # type: ignore[n
 
 
 # ============================================================
+# Patch v19 — premium HTML exam UI
+#   * deeper accents (Start button, filter tabs, chips, question index)
+#   * no A/B/C/D option letters
+#   * result stats as label-left / value-right rows
+#   * tuned for both phone and desktop screens
+# ============================================================
+
+def _premium_exam_css_v19() -> str:
+    return (
+        "\n/* ---- Patch v19: premium exam surface ---- */\n"
+        ".opt-label{display:none!important}\n"
+        ".opt{grid-template-columns:auto 1fr;padding:15px 18px}\n"
+        ".opt:hover{border-color:var(--accent)!important}\n"
+        # Deep, saturated accents in both modes.
+        "body[data-theme='light'] .btn.primary,body[data-theme='light'] .fab.primary,"
+        "body[data-theme='light'] .tab.active,body[data-theme='light'] .brand-tag"
+        "{background:color-mix(in srgb,var(--accent) 82%,#04160c)!important;color:#ffffff!important;"
+        "filter:none!important;box-shadow:0 10px 24px rgba(4,22,12,.24)}\n"
+        "body[data-theme='dark'] .btn.primary,body[data-theme='dark'] .fab.primary,"
+        "body[data-theme='dark'] .tab.active,body[data-theme='dark'] .brand-tag"
+        "{background:color-mix(in srgb,var(--accent) 88%,#0b2c1a)!important;color:#ffffff!important;filter:none!important}\n"
+        ".btn.primary,.fab.primary,.tab.active,.brand-tag{text-shadow:none}\n"
+        # Filter tabs: readable, never washed out.
+        ".tabs{gap:10px}\n"
+        ".tab{color:var(--text)!important;font-weight:800;opacity:1!important;"
+        "background:var(--surface-2)!important;border:1.5px solid var(--border)!important}\n"
+        "body[data-theme='light'] .tab{color:#0b172a!important}\n"
+        ".tab.active{border-color:transparent!important}\n"
+        # Question index / brand line contrast.
+        "body[data-theme='light'] .q-index{color:color-mix(in srgb,var(--accent) 78%,#04160c)!important}\n"
+        "body[data-theme='dark'] .q-index{color:#a7f3d0!important}\n"
+        "body[data-theme='light'] .brand-line{color:color-mix(in srgb,var(--accent) 80%,#04160c)!important}\n"
+        # Result stats: label left, value right.
+        ".summary-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}\n"
+        ".summary-grid .stat{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:14px 18px}\n"
+        ".summary-grid .stat .label{font-size:14px;margin:0;flex:1 1 auto}\n"
+        ".summary-grid .stat .value{font-size:clamp(20px,2.6vw,26px);margin:0;text-align:right;white-space:nowrap}\n"
+        ".section-grid .stat{padding:16px 18px}\n"
+        # Layout / density tuning.
+        ".shell{width:min(1080px,100% - 24px)}\n"
+        ".start-card{padding:26px;gap:16px}\n"
+        ".question-card{padding:20px 20px 22px}\n"
+        ".q-text{font-size:clamp(17px,2.5vw,24px)}\n"
+        ".opt-body{font-size:clamp(16px,2.2vw,20px)}\n"
+        ".review-q{font-size:clamp(16px,2.1vw,20px)}\n"
+        "@media(min-width:1024px){.summary-grid{grid-template-columns:repeat(3,minmax(0,1fr))}"
+        ".exam-grid{gap:20px}}\n"
+        "@media(max-width:640px){.summary-grid{grid-template-columns:1fr}"
+        ".headline{font-size:clamp(26px,7vw,34px)}"
+        ".score-ring{font-size:clamp(48px,14vw,72px)!important}"
+        ".tabs{gap:8px}.tab{padding:10px 14px;font-size:14px}"
+        ".start-card{padding:20px}.question-card{padding:16px}}\n"
+    )
+
+
+_orig_render_scroll_exam_html_v19 = render_scroll_exam_html
+
+
+def render_scroll_exam_html(draft: Any, owner_id: int) -> str:  # type: ignore[no-redef]
+    html = _orig_render_scroll_exam_html_v19(draft, owner_id)
+    # Drop the "A." / "B." prefixes at the source as well as via CSS.
+    html = html.replace(
+        "`<div class='opt-body'><span class='opt-label'>${String.fromCharCode(65+idx)}.</span> "
+        "<span class='math'>${option.raw}</span></div>`",
+        "`<div class='opt-body'><span class='math'>${option.raw}</span></div>`",
+    )
+    html = html.replace(
+        "`<div class='opt-body'><span class='opt-label'>${String.fromCharCode(65+idx)}.</span>"
+        "${option.pretty}</div>`",
+        "`<div class='opt-body'>${option.pretty}</div>`",
+    )
+    html = html.replace("</style>", _premium_exam_css_v19() + "</style>", 1)
+    return html
+
+
+
+
+# ============================================================
 # Patch v16 — deterministic inbox advance + reliable /stoptqex
 # ============================================================
 
