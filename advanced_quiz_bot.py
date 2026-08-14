@@ -10444,6 +10444,409 @@ def _build_app_v23():
 base.build_app = _build_app_v23
 
 
+# ============================================================
+# Patch v24 — Rich dashboard / backup report + owner command menu
+#   * /dbstatus renders native rich tables (safe HTML fallback)
+#   * /backupnow shows exactly which tables were backed up
+#   * every owner command is registered in the owner's inbox menu
+# ============================================================
+
+_DASH_LABELS_V24 = {label: label for _t, label in _DASH_TABLES_V23}
+
+
+def _table_breakdown_v24() -> List[Tuple[str, int]]:
+    """(table, rows) pairs of what the current backup payload contains."""
+    out: List[Tuple[str, int]] = []
+    with suppress(Exception):
+        payload = export_backup_payload_v8()
+        tables = payload.get("tables") or {}
+        for name, rows in sorted(tables.items()):
+            if isinstance(rows, list) and rows:
+                out.append((name, len(rows)))
+    return out
+
+
+def _mongo_stats_v24() -> Dict[str, Any]:
+    if not _mongo_ready_v23():
+        return {"configured": False, "connected": False, "error": "MONGODB_URI not set"}
+    try:
+        st = _mongo_v23.stats()
+        if not isinstance(st, dict):
+            return {"configured": True, "connected": False, "error": "no response"}
+        return st
+    except Exception as exc:  # pragma: no cover
+        return {"configured": True, "connected": False, "error": str(exc)}
+
+
+def _gh_stats_v24() -> Dict[str, Any]:
+    info: Dict[str, Any] = {"configured": _gh_only_ready_v23(), "snapshots": 0, "total": 0}
+    if not info["configured"]:
+        return info
+    with suppress(Exception):
+        inv = _backup_inventory_v14()
+        info["snapshots"] = len(inv.get("snapshots") or [])
+        info["total"] = inv.get("total") or 0
+        info["db_size"] = inv.get("db_size") or 0
+    return info
+
+
+def _dashboard_payload_v24() -> Dict[str, Any]:
+    return {
+        "counts": _db_counts_v23(),
+        "breakdown": _table_breakdown_v24(),
+        "gh": _gh_stats_v24(),
+        "mongo": _mongo_stats_v24(),
+    }
+
+
+def _dashboard_rich_md_v24(data: Dict[str, Any]) -> str:
+    counts = data.get("counts") or []
+    gh = data.get("gh") or {}
+    mg = data.get("mongo") or {}
+    breakdown = data.get("breakdown") or []
+
+    parts: List[str] = ["# 📊 Owner Dashboard", ""]
+    parts.append("## 🗄 Live database")
+    parts.append(_md_table(["Item", "Count"], [[lbl, f"{n}"] for lbl, n in counts], ["l", "r"]))
+
+    parts.append("")
+    parts.append("## 💾 What gets backed up")
+    if breakdown:
+        rows = [[name, f"{n}"] for name, n in breakdown]
+        rows.append(["TOTAL", f"{sum(n for _n, n in breakdown)}"])
+        parts.append(_md_table(["Table", "Rows"], rows, ["l", "r"]))
+    else:
+        parts.append("> Nothing stored yet.")
+
+    parts.append("")
+    parts.append("## ☁️ Storage health")
+    storage_rows = [
+        [
+            "GitHub",
+            "✅ ready" if gh.get("configured") else "❌ not configured",
+            f"{gh.get('snapshots', 0)} snap • {_fmt_bytes_v14(gh.get('total'))}",
+        ],
+        [
+            "MongoDB",
+            ("✅ connected" if mg.get("connected") else ("⚠️ unreachable" if mg.get("configured") else "❌ not configured")),
+            f"{mg.get('rows', 0)} rows • {mg.get('snapshots', 0)} snap • {_fmt_bytes_v14(mg.get('storage'))}",
+        ],
+    ]
+    parts.append(_md_table(["Destination", "Status", "Details"], storage_rows, ["l", "c", "r"]))
+
+    detail: List[str] = []
+    if gh.get("configured"):
+        detail.append(f"- **GitHub repo:** `{base.GITHUB_REPO}` → `{base.GITHUB_STATE_PATH}`")
+    if mg.get("configured"):
+        detail.append(f"- **Mongo database:** `{mg.get('db')}`")
+        ts = int(mg.get("last_backup") or 0)
+        if ts:
+            detail.append(f"- **Last Mongo backup:** `{_dt_v14.fromtimestamp(ts):%Y-%m-%d %H:%M}`")
+        if mg.get("error"):
+            detail.append(f"- ⚠️ **Mongo error:** `{str(mg.get('error'))[:160]}`")
+    if detail:
+        parts.append("")
+        parts.extend(detail)
+
+    parts.append("")
+    parts.append("> `/backupnow` to save • `/backups` to restore • `/dbstatus` to refresh")
+    return "\n".join(parts)
+
+
+def _dashboard_html_v24(data: Dict[str, Any]) -> str:
+    counts = data.get("counts") or []
+    gh = data.get("gh") or {}
+    mg = data.get("mongo") or {}
+    breakdown = data.get("breakdown") or []
+    esc = base.html_escape
+
+    lines = ["📊 <b>Owner Dashboard</b>", "", "<b>🗄 Live database</b>"]
+    for lbl, n in counts:
+        lines.append(f"• {esc(lbl)}: <b>{n}</b>")
+
+    lines.append("")
+    lines.append("<b>💾 What gets backed up</b>")
+    if breakdown:
+        for name, n in breakdown[:30]:
+            lines.append(f"• <code>{esc(name)}</code> — <b>{n}</b>")
+        lines.append(f"• <b>TOTAL: {sum(n for _n, n in breakdown)} rows</b>")
+    else:
+        lines.append("• nothing stored yet")
+
+    lines.append("")
+    lines.append("<b>☁️ Storage — GitHub</b>")
+    if gh.get("configured"):
+        lines.append(f"• Repo: <code>{esc(str(base.GITHUB_REPO))}</code>")
+        lines.append(f"• File: <code>{esc(str(base.GITHUB_STATE_PATH))}</code>")
+        lines.append(f"• Snapshots: <b>{gh.get('snapshots', 0)}</b>")
+        lines.append(f"• Space used: <b>{_fmt_bytes_v14(gh.get('total'))}</b>")
+    else:
+        lines.append("• ❌ not configured (GITHUB_TOKEN / GITHUB_REPO)")
+
+    lines.append("")
+    lines.append("<b>☁️ Storage — MongoDB</b>")
+    if not mg.get("configured"):
+        lines.append("• ❌ not configured (MONGODB_URI)")
+    else:
+        lines.append(f"• Status: {'✅ connected' if mg.get('connected') else '⚠️ unreachable'}")
+        lines.append(f"• Database: <code>{esc(str(mg.get('db')))}</code>")
+        lines.append(f"• Backed-up rows: <b>{mg.get('rows', 0)}</b> in {mg.get('tables', 0)} collections")
+        lines.append(f"• Snapshots: <b>{mg.get('snapshots', 0)}</b>")
+        lines.append(f"• Space used: <b>{_fmt_bytes_v14(mg.get('storage'))}</b>")
+        ts = int(mg.get("last_backup") or 0)
+        if ts:
+            lines.append(f"• Last backup: <code>{_dt_v14.fromtimestamp(ts):%Y-%m-%d %H:%M}</code>")
+        if mg.get("error"):
+            lines.append(f"• ⚠️ {esc(str(mg.get('error'))[:180])}")
+
+    lines.append("")
+    lines.append("Use /backupnow to save, /backups to restore.")
+    return "\n".join(lines)
+
+
+async def cmd_dbstatus_v24(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    user = update.effective_user
+    if not message or not user:
+        return
+    if not base.is_owner(user.id):
+        await base.safe_reply(message, "Only the bot owner can view the dashboard.")
+        raise ApplicationHandlerStop
+    notice = None
+    with suppress(Exception):
+        notice = await message.reply_text("⏳ Collecting live data…")
+    try:
+        data = await asyncio.get_event_loop().run_in_executor(None, _dashboard_payload_v24)
+        md = _dashboard_rich_md_v24(data)
+        html_text = _dashboard_html_v24(data)[:3900]
+        sent = await send_rich_or_html(context, message.chat_id, md, html_text, plain="Owner dashboard")
+        if sent and notice is not None:
+            with suppress(Exception):
+                await notice.delete()
+        elif notice is not None:
+            with suppress(Exception):
+                await notice.edit_text(html_text, parse_mode=ParseMode.HTML)
+    except Exception as exc:
+        base.logger.exception("Dashboard v24 failed")
+        txt = f"❌ Dashboard error: <code>{base.html_escape(str(exc))[:300]}</code>"
+        if notice is not None:
+            with suppress(Exception):
+                await notice.edit_text(txt, parse_mode=ParseMode.HTML)
+        else:
+            with suppress(Exception):
+                await message.reply_text(txt, parse_mode=ParseMode.HTML)
+    raise ApplicationHandlerStop
+
+
+def _backup_report_v24() -> Dict[str, Any]:
+    breakdown = _table_breakdown_v24()
+    info = _backup_now_v23()
+    info["breakdown"] = breakdown
+    info["mongo_stats"] = _mongo_stats_v24()
+    return info
+
+
+def _backup_rich_md_v24(info: Dict[str, Any]) -> str:
+    breakdown = info.get("breakdown") or []
+    mg = info.get("mongo_stats") or {}
+    parts = ["# ✅ Backup complete", ""]
+    parts.append("## 📦 Saved tables")
+    if breakdown:
+        rows = [[name, f"{n}"] for name, n in breakdown]
+        rows.append(["TOTAL", f"{sum(n for _n, n in breakdown)}"])
+        parts.append(_md_table(["Table", "Rows"], rows, ["l", "r"]))
+    else:
+        parts.append("> Database is empty — nothing to save.")
+
+    gh_status = (
+        f"✅ {_fmt_bytes_v14(info.get('main_size'))}"
+        if info.get("github_ok")
+        else f"❌ {str(info.get('github_error') or 'not configured')[:80]}"
+    )
+    mg_status = (
+        f"✅ {info.get('mongo_rows', 0)} rows → {info.get('mongo_tables', 0)} collections"
+        if info.get("mongo_ok")
+        else f"❌ {str(info.get('mongo_error') or 'not configured')[:80]}"
+    )
+    parts.append("")
+    parts.append("## ☁️ Destinations")
+    parts.append(
+        _md_table(
+            ["Destination", "Result"],
+            [["GitHub", gh_status], ["MongoDB", mg_status]],
+            ["l", "r"],
+            cell_limit=90,
+        )
+    )
+    parts.append("")
+    parts.append(
+        "\n".join(
+            [
+                f"- [{'x' if info.get('github_ok') else ' '}] GitHub mirror updated",
+                f"- [{'x' if info.get('mongo_ok') else ' '}] MongoDB mirror updated",
+                "- [x] Cumulative — old backups are never deleted",
+            ]
+        )
+    )
+    if mg.get("connected"):
+        parts.append("")
+        parts.append(f"> Mongo total: **{mg.get('rows', 0)}** rows • {_fmt_bytes_v14(mg.get('storage'))}")
+    parts.append("")
+    parts.append("> `/backups` to restore • `/dbstatus` for the dashboard")
+    return "\n".join(parts)
+
+
+def _backup_html_v24(info: Dict[str, Any]) -> str:
+    esc = base.html_escape
+    breakdown = info.get("breakdown") or []
+    lines = ["✅ <b>Backup complete</b>", "", "<b>📦 Saved tables</b>"]
+    if breakdown:
+        for name, n in breakdown[:30]:
+            lines.append(f"• <code>{esc(name)}</code> — <b>{n}</b>")
+        lines.append(f"• <b>TOTAL: {sum(n for _n, n in breakdown)} rows</b>")
+    else:
+        lines.append("• database is empty")
+    gh_line = (
+        f"✅ <code>{esc(str(base.GITHUB_STATE_PATH))}</code> ({_fmt_bytes_v14(info.get('main_size'))})"
+        if info.get("github_ok")
+        else "❌ " + esc(str(info.get("github_error") or "not configured"))[:160]
+    )
+    mongo_line = (
+        f"✅ {info.get('mongo_rows', 0)} rows → {info.get('mongo_tables', 0)} collections"
+        if info.get("mongo_ok")
+        else "❌ " + esc(str(info.get("mongo_error") or "not configured"))[:160]
+    )
+    lines += ["", "<b>☁️ Destinations</b>", f"• GitHub: {gh_line}", f"• MongoDB: {mongo_line}", ""]
+    lines.append("Everything is cumulative — old backups are never deleted.")
+    lines.append("Use /backups to restore, /dbstatus for the dashboard.")
+    return "\n".join(lines)
+
+
+async def cmd_backupnow_v24(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    user = update.effective_user
+    if not message or not user:
+        return
+    if not base.is_owner(user.id):
+        await base.safe_reply(message, "Only the bot owner can trigger backups.")
+        raise ApplicationHandlerStop
+    if not (_gh_only_ready_v23() or _mongo_ready_v23()):
+        await message.reply_text(
+            "❌ No backup destination configured.\n"
+            "Set <code>GITHUB_TOKEN</code> + <code>GITHUB_REPO</code> and/or "
+            "<code>MONGODB_URI</code>, then redeploy.",
+            parse_mode=ParseMode.HTML,
+        )
+        raise ApplicationHandlerStop
+    notice = None
+    with suppress(Exception):
+        notice = await message.reply_text("⏳ Backing up to GitHub + MongoDB…")
+    loop = asyncio.get_event_loop()
+    try:
+        info = await loop.run_in_executor(None, _backup_report_v24)
+        with suppress(Exception):
+            inv = await loop.run_in_executor(None, _backup_inventory_v14)
+            _BACKUP_CACHE_V14[user.id] = inv["snapshots"]
+        md = _backup_rich_md_v24(info)
+        html_text = _backup_html_v24(info)[:3900]
+        sent = await send_rich_or_html(context, message.chat_id, md, html_text, plain="Backup report")
+        if sent and notice is not None:
+            with suppress(Exception):
+                await notice.delete()
+        elif notice is not None:
+            with suppress(Exception):
+                await notice.edit_text(html_text, parse_mode=ParseMode.HTML)
+    except Exception as exc:
+        base.logger.exception("Backup v24 failed")
+        txt = f"❌ Backup error: <code>{base.html_escape(str(exc))[:300]}</code>"
+        if notice is not None:
+            with suppress(Exception):
+                await notice.edit_text(txt, parse_mode=ParseMode.HTML)
+        else:
+            with suppress(Exception):
+                await message.reply_text(txt, parse_mode=ParseMode.HTML)
+    raise ApplicationHandlerStop
+
+
+# ------------------------------------------------------------
+# Owner inbox command menu
+# ------------------------------------------------------------
+
+_OWNER_EXTRA_COMMANDS_V24 = [
+    ("backupnow", "💾 Backup now (GitHub + MongoDB)"),
+    ("backups", "🗂 Backup vault / restore"),
+    ("restorebackup", "♻️ Restore everything"),
+    ("dbstatus", "📊 Owner dashboard & storage"),
+    ("richstatus", "✨ Rich format status"),
+]
+
+
+def _owner_command_list_v24() -> List[Any]:
+    from telegram import BotCommand as _BC
+
+    seen: set = set()
+    out: List[Any] = []
+
+    def _add(cmd: str, desc: str) -> None:
+        c = str(cmd).lstrip("/").strip().lower()
+        if not c or c in seen:
+            return
+        seen.add(c)
+        out.append(_BC(c, str(desc)[:256]))
+
+    for getter in ("everyone_private_commands", "admin_private_commands", "owner_private_commands"):
+        fn = getattr(base, getter, None)
+        if not callable(fn):
+            continue
+        with suppress(Exception):
+            for bc in fn() or []:
+                _add(getattr(bc, "command", ""), getattr(bc, "description", ""))
+    for cmd, desc in _OWNER_EXTRA_COMMANDS_V24:
+        _add(cmd, desc)
+    return out[:100]
+
+
+async def _push_owner_commands_v24(app) -> None:
+    from telegram import BotCommandScopeChat
+
+    cmds = _owner_command_list_v24()
+    if not cmds:
+        return
+    for oid in list(getattr(base.CONFIG, "owner_ids", []) or []):
+        with suppress(Exception):
+            await app.bot.set_my_commands(cmds, scope=BotCommandScopeChat(chat_id=int(oid)))
+    base.logger.info("Owner command menu synced (%s commands).", len(cmds))
+
+
+_orig_build_app_v24 = base.build_app
+
+
+def _build_app_v24():
+    app = _orig_build_app_v24()
+    with suppress(Exception):
+        from telegram.ext import CommandHandler as _CH24
+
+        app.add_handler(_CH24("backupnow", cmd_backupnow_v24), group=-700)
+        app.add_handler(_CH24(["dbstatus", "dashboard", "storage"], cmd_dbstatus_v24), group=-700)
+
+    prev_post_init = getattr(app, "post_init", None)
+
+    async def _post_init_v24(application) -> None:
+        if callable(prev_post_init):
+            with suppress(Exception):
+                await prev_post_init(application)
+        with suppress(Exception):
+            await _push_owner_commands_v24(application)
+
+    with suppress(Exception):
+        app.post_init = _post_init_v24
+    return app
+
+
+base.build_app = _build_app_v24
+
+
 if __name__ == "__main__":
     base.main()
+
 
