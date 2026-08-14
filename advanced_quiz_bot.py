@@ -5344,7 +5344,7 @@ async def handle_inline_query(update: Update, context) -> None:
 
 
 if __name__ == "__main__":
-    #base.main()
+    pass  # real entrypoint is at the end of this file
 
 # ============================================================
 # Final patch v9: robust text import, fixed HTML export,
