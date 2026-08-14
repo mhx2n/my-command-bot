@@ -5340,7 +5340,469 @@ async def handle_inline_query(update: Update, context) -> None:
 
 
 
-#if __name__ == "__main__":
+#
+# ============================================================
+# Patch v25 — Backup vault 2.0 + full database reset
+#   * /backups  -> rich vault (GitHub + MongoDB snapshots, restore buttons)
+#   * /resetdb  -> wipe every row and start fresh (double confirmation)
+#   * owner inbox menu lists every command
+# ============================================================
+
+_VAULT_CACHE_V25: Dict[int, List[Dict[str, Any]]] = {}
+
+_RESET_KEEP_V25 = {"bot_settings", "bot_admins"}
+
+
+def _all_tables_v25() -> List[str]:
+    out: List[str] = []
+    with suppress(Exception):
+        with closing(base.DBH.connect()) as conn:
+            rows = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+            ).fetchall()
+            out = [str(r[0]) for r in rows]
+    return sorted(out)
+
+
+def _reset_database_v25(keep_settings: bool = True) -> Dict[str, Any]:
+    """Delete every row from the live database. Backups are never touched."""
+    deleted: List[Tuple[str, int]] = []
+    total = 0
+    tables = _all_tables_v25()
+    with closing(base.DBH.connect()) as conn:
+        for table in tables:
+            if keep_settings and table in _RESET_KEEP_V25:
+                continue
+            try:
+                n = int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] or 0)
+                conn.execute(f"DELETE FROM {table}")
+                if n:
+                    deleted.append((table, n))
+                    total += n
+            except Exception:
+                continue
+        with suppress(Exception):
+            conn.commit()
+    with suppress(Exception):
+        with closing(base.DBH.connect()) as conn:
+            conn.execute("VACUUM")
+    return {"deleted": deleted, "total": total, "kept": sorted(_RESET_KEEP_V25) if keep_settings else []}
+
+
+def _vault_inventory_v25() -> Dict[str, Any]:
+    inv: Dict[str, Any] = {"snapshots": [], "total": 0, "db_size": 0, "gh": 0, "mongo": 0}
+    with suppress(Exception):
+        base_inv = _backup_inventory_v14()
+        snaps = list(base_inv.get("snapshots") or [])
+        for s in snaps:
+            s = dict(s)
+            s["src"] = "GitHub"
+            inv["snapshots"].append(s)
+        inv["total"] = int(base_inv.get("total") or 0)
+        inv["db_size"] = int(base_inv.get("db_size") or 0)
+        inv["gh"] = len(snaps)
+    if _mongo_ready_v23():
+        with suppress(Exception):
+            for s in _mongo_v23.list_snapshots() or []:
+                s = dict(s)
+                s["src"] = "MongoDB"
+                inv["snapshots"].append(s)
+                inv["mongo"] += 1
+                inv["total"] += int(s.get("size") or 0)
+    inv["snapshots"].sort(key=lambda x: str(x.get("name") or ""), reverse=True)
+    inv["counts"] = _db_counts_v23()
+    return inv
+
+
+def _vault_rich_md_v25(inv: Dict[str, Any]) -> str:
+    snaps = inv.get("snapshots") or []
+    parts: List[str] = ["# 🗂 Backup Vault", ""]
+    parts.append("## 📦 Storage")
+    parts.append(
+        _md_table(
+            ["Source", "Snapshots", "Status"],
+            [
+                ["GitHub", f"{inv.get('gh', 0)}", "✅ ready" if _gh_only_ready_v23() else "❌ not set"],
+                ["MongoDB", f"{inv.get('mongo', 0)}", "✅ ready" if _mongo_ready_v23() else "❌ not set"],
+            ],
+            ["l", "r", "r"],
+            cell_limit=40,
+        )
+    )
+    parts += ["", "## 🗄 Live database"]
+    counts = inv.get("counts") or []
+    if counts:
+        parts.append(_md_table(["Item", "Count"], [[l, f"{n}"] for l, n in counts], ["l", "r"]))
+    else:
+        parts.append("> Database is empty.")
+    parts += ["", "## 🕘 Saved backups"]
+    if snaps:
+        rows = []
+        for i, s in enumerate(snaps[:10], start=1):
+            rows.append([f"#{i}", str(s.get("src")), str(s.get("name"))[:26], _fmt_bytes_v14(s.get("size"))])
+        parts.append(_md_table(["#", "Source", "Name", "Size"], rows, ["l", "l", "l", "r"], cell_limit=40))
+    else:
+        parts.append("> No snapshot yet — send /backupnow.")
+    parts += [
+        "",
+        f"> Total backup space: **{_fmt_bytes_v14(inv.get('total'))}** • "
+        f"local DB **{_fmt_bytes_v14(inv.get('db_size'))}**",
+        "",
+        "> ⬇️ restore a snapshot • ♻️ restore everything • 🧹 reset the database",
+    ]
+    return "\n".join(parts)
+
+
+def _vault_html_v25(inv: Dict[str, Any]) -> str:
+    esc = base.html_escape
+    snaps = inv.get("snapshots") or []
+    lines = ["🗂 <b>Backup Vault</b>", ""]
+    lines.append(f"• GitHub: <b>{inv.get('gh', 0)}</b> snapshots")
+    lines.append(f"• MongoDB: <b>{inv.get('mongo', 0)}</b> snapshots")
+    lines.append(f"• Total space: <b>{_fmt_bytes_v14(inv.get('total'))}</b>")
+    lines.append(f"• Local database: <b>{_fmt_bytes_v14(inv.get('db_size'))}</b>")
+    lines += ["", "<b>Live database</b>"]
+    for label, n in (inv.get("counts") or []):
+        lines.append(f"• {esc(label)}: <b>{n}</b>")
+    lines += ["", "<b>Saved backups</b>"]
+    if snaps:
+        for i, s in enumerate(snaps[:10], start=1):
+            lines.append(
+                f"{i}. [{esc(str(s.get('src')))}] <code>{esc(str(s.get('name')))}</code> "
+                f"— {_fmt_bytes_v14(s.get('size'))}"
+            )
+    else:
+        lines.append("• none yet — send /backupnow")
+    return "\n".join(lines)
+
+
+def _vault_markup_v25(inv: Dict[str, Any]) -> InlineKeyboardMarkup:
+    snaps = inv.get("snapshots") or []
+    rows: List[List[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton("💾 Backup now", callback_data="bk25:new"),
+            InlineKeyboardButton("🔄 Refresh", callback_data="bk25:list"),
+        ],
+        [InlineKeyboardButton("♻️ Restore everything", callback_data="bk25:ask:all")],
+    ]
+    row: List[InlineKeyboardButton] = []
+    for idx, _s in enumerate(snaps[:10], start=1):
+        row.append(InlineKeyboardButton(f"⬇️ #{idx}", callback_data=f"bk25:ask:{idx - 1}"))
+        if len(row) == 5:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("🧹 Reset database", callback_data="bk25:reset")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def _show_vault_v25(context, chat_id: int, user_id: int) -> None:
+    inv = await asyncio.get_event_loop().run_in_executor(None, _vault_inventory_v25)
+    _VAULT_CACHE_V25[int(user_id)] = inv.get("snapshots") or []
+    await send_rich_or_html(
+        context,
+        chat_id,
+        _vault_rich_md_v25(inv),
+        _vault_html_v25(inv)[:3900],
+        reply_markup=_vault_markup_v25(inv),
+        plain="Backup vault",
+    )
+
+
+async def cmd_backups_v25(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    user = update.effective_user
+    if not message or not user:
+        return
+    if not base.is_owner(user.id):
+        await base.safe_reply(message, "Only the bot owner can manage backups.")
+        raise ApplicationHandlerStop
+    notice = None
+    with suppress(Exception):
+        notice = await message.reply_text("⏳ Loading backup vault…")
+    try:
+        await _show_vault_v25(context, message.chat_id, user.id)
+        if notice is not None:
+            with suppress(Exception):
+                await notice.delete()
+    except Exception as exc:
+        base.logger.exception("Backup vault v25 failed")
+        txt = f"❌ Vault error: <code>{base.html_escape(str(exc))[:300]}</code>"
+        if notice is not None:
+            with suppress(Exception):
+                await notice.edit_text(txt, parse_mode=ParseMode.HTML)
+        else:
+            with suppress(Exception):
+                await message.reply_text(txt, parse_mode=ParseMode.HTML)
+    raise ApplicationHandlerStop
+
+
+def _resolve_snapshot_v25(user_id: int, key: str) -> Tuple[str, str]:
+    if key == "all":
+        return "*all*", "every backup (GitHub + MongoDB)"
+    snaps = _VAULT_CACHE_V25.get(int(user_id)) or []
+    try:
+        item = snaps[int(key)]
+    except Exception:
+        return "", ""
+    return str(item.get("path") or ""), f"{item.get('src')} • {item.get('name')}"
+
+
+def _reset_report_html_v25(res: Dict[str, Any]) -> str:
+    esc = base.html_escape
+    lines = ["🧹 <b>Database reset complete</b>", ""]
+    if res.get("deleted"):
+        for name, n in res["deleted"][:30]:
+            lines.append(f"• <code>{esc(name)}</code> — {n} rows removed")
+    else:
+        lines.append("• database was already empty")
+    lines.append("")
+    lines.append(f"<b>Total removed:</b> {res.get('total', 0)} rows")
+    if res.get("kept"):
+        lines.append("<b>Kept:</b> " + ", ".join(f"<code>{esc(k)}</code>" for k in res["kept"]))
+    lines.append("")
+    lines.append("Backups on GitHub / MongoDB are untouched — /backups can bring everything back.")
+    return "\n".join(lines)
+
+
+def _reset_report_md_v25(res: Dict[str, Any]) -> str:
+    parts = ["# 🧹 Database reset complete", ""]
+    rows = [[n, f"{c}"] for n, c in (res.get("deleted") or [])]
+    if rows:
+        rows.append(["TOTAL", f"{res.get('total', 0)}"])
+        parts.append(_md_table(["Table", "Rows removed"], rows, ["l", "r"]))
+    else:
+        parts.append("> Database was already empty.")
+    if res.get("kept"):
+        parts += ["", "> Kept: " + ", ".join(f"`{k}`" for k in res["kept"])]
+    parts += ["", "> Backups are untouched — use `/backups` to restore anytime."]
+    return "\n".join(parts)
+
+
+async def on_vault_cb_v25(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    user = update.effective_user
+    if not query or not query.data or not user:
+        return
+    if not base.is_owner(user.id):
+        with suppress(Exception):
+            await query.answer("Owner only.", show_alert=True)
+        return
+    parts = query.data.split(":")
+    action = parts[1] if len(parts) > 1 else ""
+    with suppress(Exception):
+        await query.answer()
+    chat_id = query.message.chat_id
+    loop = asyncio.get_event_loop()
+
+    if action in {"list", "new"}:
+        if action == "new":
+            with suppress(Exception):
+                await query.edit_message_text("⏳ Backing up to GitHub + MongoDB…")
+            with suppress(Exception):
+                await loop.run_in_executor(None, _backup_now_v23)
+        with suppress(Exception):
+            await query.message.delete()
+        await _show_vault_v25(context, chat_id, user.id)
+        return
+
+    if action == "ask":
+        key = parts[2] if len(parts) > 2 else ""
+        path, label = _resolve_snapshot_v25(user.id, key)
+        if not path:
+            with suppress(Exception):
+                await query.answer("Snapshot not listed anymore — refresh.", show_alert=True)
+            return
+        markup = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Yes, restore", callback_data=f"bk25:do:{key}"),
+            InlineKeyboardButton("✖️ Cancel", callback_data="bk25:list"),
+        ]])
+        with suppress(Exception):
+            await query.message.reply_text(
+                "♻️ <b>Restore backup?</b>\n\n"
+                f"<b>Source:</b> {base.html_escape(label)}\n\n"
+                "Rows with the same ids will be overwritten by the backup data.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=markup,
+            )
+        return
+
+    if action == "do":
+        key = parts[2] if len(parts) > 2 else ""
+        path, label = _resolve_snapshot_v25(user.id, key)
+        if not path:
+            return
+        with suppress(Exception):
+            await query.edit_message_text("⏳ Restoring…")
+        try:
+            if key == "all":
+                ok, rows = await loop.run_in_executor(None, _restore_everything_v23)
+            else:
+                ok, rows = await loop.run_in_executor(None, _restore_from_path_v23, path)
+            text = (
+                "✅ <b>Restore complete</b>\n\n"
+                f"<b>Source:</b> {base.html_escape(label)}\n"
+                f"<b>Rows restored:</b> {rows}"
+                if ok
+                else "⚠️ Nothing restored — that backup was empty or unreadable."
+            )
+        except Exception as exc:
+            text = f"❌ Restore error: <code>{base.html_escape(str(exc))[:300]}</code>"
+        with suppress(Exception):
+            await query.edit_message_text(text, parse_mode=ParseMode.HTML)
+        return
+
+    if action == "reset":
+        markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🧨 Erase EVERYTHING", callback_data="bk25:wipe:all")],
+            [InlineKeyboardButton("🧹 Erase data, keep admins & settings", callback_data="bk25:wipe:keep")],
+            [InlineKeyboardButton("✖️ Cancel", callback_data="bk25:list")],
+        ])
+        with suppress(Exception):
+            await query.message.reply_text(
+                "⚠️ <b>Reset the database?</b>\n\n"
+                "Every exam, question, session, result and user record will be removed "
+                "and the bot starts fresh.\n"
+                "GitHub / MongoDB backups stay safe — you can restore later from /backups.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=markup,
+            )
+        return
+
+    if action == "wipe":
+        mode = parts[2] if len(parts) > 2 else "keep"
+        with suppress(Exception):
+            await query.edit_message_text("⏳ Resetting database…")
+        try:
+            res = await loop.run_in_executor(None, _reset_database_v25, mode != "all")
+            html_text = _reset_report_html_v25(res)[:3900]
+            sent = await send_rich_or_html(
+                context, chat_id, _reset_report_md_v25(res), html_text, plain="Database reset"
+            )
+            if sent:
+                with suppress(Exception):
+                    await query.message.delete()
+            else:
+                with suppress(Exception):
+                    await query.edit_message_text(html_text, parse_mode=ParseMode.HTML)
+        except Exception as exc:
+            base.logger.exception("Reset v25 failed")
+            with suppress(Exception):
+                await query.edit_message_text(
+                    f"❌ Reset error: <code>{base.html_escape(str(exc))[:300]}</code>",
+                    parse_mode=ParseMode.HTML,
+                )
+        return
+
+
+async def cmd_resetdb_v25(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    user = update.effective_user
+    if not message or not user:
+        return
+    if not base.is_owner(user.id):
+        await base.safe_reply(message, "Only the bot owner can reset the database.")
+        raise ApplicationHandlerStop
+    counts = await asyncio.get_event_loop().run_in_executor(None, _db_counts_v23)
+    lines = ["🧹 <b>Reset database</b>", "", "<b>Current data</b>"]
+    for label, n in counts:
+        lines.append(f"• {base.html_escape(label)}: <b>{n}</b>")
+    lines += [
+        "",
+        "Choose how you want to start fresh.",
+        "Backups on GitHub / MongoDB are never deleted — /backups can restore them.",
+    ]
+    markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🧨 Erase EVERYTHING", callback_data="bk25:wipe:all")],
+        [InlineKeyboardButton("🧹 Erase data, keep admins & settings", callback_data="bk25:wipe:keep")],
+        [InlineKeyboardButton("✖️ Cancel", callback_data="bk25:list")],
+    ])
+    with suppress(Exception):
+        await message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=markup)
+    raise ApplicationHandlerStop
+
+
+_OWNER_EXTRA_COMMANDS_V25 = [
+    ("backupnow", "💾 Backup now (GitHub + MongoDB)"),
+    ("backups", "🗂 Backup vault / restore / reset"),
+    ("restorebackup", "♻️ Restore everything"),
+    ("dbstatus", "📊 Owner dashboard & storage"),
+    ("resetdb", "🧹 Erase database and start fresh"),
+    ("richstatus", "✨ Rich format status"),
+    ("sharenote", "📝 Set share-card note"),
+    ("commands", "📜 Full command list"),
+]
+
+
+def _owner_command_list_v25() -> List[Any]:
+    from telegram import BotCommand as _BC
+
+    seen: set = set()
+    out: List[Any] = []
+
+    def _add(cmd: str, desc: str) -> None:
+        c = str(cmd).lstrip("/").strip().lower()
+        if not c or c in seen:
+            return
+        seen.add(c)
+        out.append(_BC(c, (str(desc) or c)[:256]))
+
+    for bc in _owner_command_list_v24():
+        _add(getattr(bc, "command", ""), getattr(bc, "description", ""))
+    for getter in ("group_admin_commands",):
+        fn = getattr(base, getter, None)
+        if callable(fn):
+            with suppress(Exception):
+                for bc in fn() or []:
+                    _add(getattr(bc, "command", ""), getattr(bc, "description", ""))
+    for cmd, desc in _OWNER_EXTRA_COMMANDS_V25:
+        _add(cmd, desc)
+    return out[:100]
+
+
+async def _push_owner_commands_v25(app) -> None:
+    from telegram import BotCommandScopeChat
+
+    cmds = _owner_command_list_v25()
+    if not cmds:
+        return
+    for oid in list(getattr(base, "OWNER_IDS", []) or []):
+        with suppress(Exception):
+            await app.bot.set_my_commands(cmds, scope=BotCommandScopeChat(chat_id=int(oid)))
+
+
+_orig_build_app_v25 = base.build_app
+
+
+def _build_app_v25():
+    app = _orig_build_app_v25()
+    with suppress(Exception):
+        from telegram.ext import CallbackQueryHandler as _CQ25
+        from telegram.ext import CommandHandler as _CH25
+
+        app.add_handler(_CH25(["backups", "backupvault", "vault"], cmd_backups_v25), group=-900)
+        app.add_handler(_CH25(["resetdb", "cleardb", "freshstart"], cmd_resetdb_v25), group=-900)
+        app.add_handler(_CQ25(on_vault_cb_v25, pattern=r"^bk25:"), group=-900)
+
+    prev_post_init = getattr(app, "post_init", None)
+
+    async def _post_init_v25(application) -> None:
+        if callable(prev_post_init):
+            with suppress(Exception):
+                await prev_post_init(application)
+        with suppress(Exception):
+            await _push_owner_commands_v25(application)
+
+    with suppress(Exception):
+        app.post_init = _post_init_v25
+    return app
+
+
+base.build_app = _build_app_v25
+
+
+if __name__ == "__main__":
     #base.main()
 
 # ============================================================
