@@ -10044,5 +10044,63 @@ def render_scroll_exam_html(draft: Any, owner_id: int) -> str:  # type: ignore[n
     return html
 
 
+# ============================================================
+# Patch v22 — centered brand tag + fully readable dark mode
+# ============================================================
+
+def _brand_dark_css_v22() -> str:
+    return (
+        "\n/* ---- Patch v22: centered brand + readable dark mode ---- */\n"
+        # Brand pill perfectly centered on the start card.
+        ".start-card{justify-items:center;text-align:center}\n"
+        ".start-card .brand-tag{align-self:center!important;justify-self:center!important;"
+        "display:flex!important;align-items:center;justify-content:center;text-align:center;"
+        "min-height:44px;padding:10px 26px;width:auto;max-width:100%;letter-spacing:1.2px;"
+        "font-size:clamp(13px,3vw,16px);line-height:1.2}\n"
+        ".start-card .headline,.start-card .submeta{text-align:center;justify-content:center}\n"
+        ".start-card .input{width:100%;text-align:center}\n"
+        ".start-card .actions{display:flex;flex-wrap:wrap;gap:12px;justify-content:center;width:100%}\n"
+        ".start-card #sectionsWrap{width:100%}\n"
+        ".start-card .chips{justify-content:center}\n"
+        # Topbar brand line centered with its title block on phones.
+        ".topbar .brand-line{letter-spacing:.6px}\n"
+        # ---- Dark mode: everything legible (white / near-white) ----
+        "body[data-theme='dark'] .brand-line{color:#ffffff!important;opacity:1!important;"
+        "text-shadow:0 1px 2px rgba(0,0,0,.55)}\n"
+        "body[data-theme='dark'] .topbar .brand h1,body[data-theme='dark'] .headline,"
+        "body[data-theme='dark'] .result-title{color:#f8fafc!important}\n"
+        "body[data-theme='dark'] .meta,body[data-theme='dark'] .muted,"
+        "body[data-theme='dark'] .submeta{color:#cbd5e1!important}\n"
+        "body[data-theme='dark'] .q-text,body[data-theme='dark'] .opt-body,"
+        "body[data-theme='dark'] .review-q,body[data-theme='dark'] .answer-line,"
+        "body[data-theme='dark'] .stat .value{color:#f1f5f9!important}\n"
+        "body[data-theme='dark'] .stat .label{color:#cbd5e1!important}\n"
+        "body[data-theme='dark'] .q-index{color:#bbf7d0!important}\n"
+        "body[data-theme='dark'] .score-ring{color:#ffffff!important}\n"
+        "body[data-theme='dark'] .palette .pal,body[data-theme='dark'] .palette button,"
+        "body[data-theme='dark'] .chip{color:#e2e8f0!important;border-color:rgba(226,232,240,.28)!important}\n"
+        "body[data-theme='dark'] .tab{color:#e2e8f0!important;"
+        "border-color:rgba(226,232,240,.26)!important}\n"
+        "body[data-theme='dark'] .tab.active{color:#ffffff!important}\n"
+        "body[data-theme='dark'] .brand-tag{color:#ffffff!important}\n"
+        "body[data-theme='dark'] .timer .label{color:#cbd5e1!important}\n"
+        "body[data-theme='dark'] .timer .value{color:#ffffff!important}\n"
+        "body[data-theme='dark'] .input,body[data-theme='dark'] input,"
+        "body[data-theme='dark'] .btn.secondary{color:#f1f5f9!important}\n"
+        "body[data-theme='dark'] .input::placeholder{color:#94a3b8!important}\n"
+        "@media(max-width:640px){.topbar .inner{gap:10px}"
+        ".start-card .brand-tag{padding:10px 20px}}\n"
+    )
+
+
+_orig_render_scroll_exam_html_v22 = render_scroll_exam_html
+
+
+def render_scroll_exam_html(draft: Any, owner_id: int) -> str:  # type: ignore[no-redef]
+    html = _orig_render_scroll_exam_html_v22(draft, owner_id)
+    html = html.replace("</style>", _brand_dark_css_v22() + "</style>", 1)
+    return html
+
+
 if __name__ == "__main__":
     base.main()
