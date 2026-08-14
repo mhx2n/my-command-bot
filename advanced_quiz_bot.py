@@ -9057,9 +9057,18 @@ def _pk_cols_v15(conn: Any, table: str) -> List[str]:
     return [str(r[1]) for r in info if int(r[5] or 0) > 0]
 
 
-def _row_key_v15(row: Dict[str, Any], pks: List[str]) -> str:
-    if pks and all(c in row for c in pks):
-        return "pk::" + "\u0001".join(str(row.get(c)) for c in pks)
+def _row_key_v15(row: Dict[str, Any], pks: List[str], table: str = "") -> str:
+    # AUTOINCREMENT ids are local to one SQLite file and can be reused after a
+    # restart/reset.  Stable domain keys keep unrelated questions from
+    # overwriting each other in cumulative GitHub/Mongo backups.
+    logical_keys = {
+        "draft_questions": ["draft_id", "q_no"],
+        "session_questions": ["session_id", "q_no"],
+        "draft_sections": ["draft_id", "section_no"],
+    }
+    keys = logical_keys.get(table, pks)
+    if keys and all(c in row for c in keys):
+        return "pk::" + "\u0001".join(str(row.get(c)) for c in keys)
     try:
         return "row::" + json.dumps(row, sort_keys=True, ensure_ascii=False, default=str)
     except Exception:
@@ -9085,10 +9094,10 @@ def _merge_tables_v15(old: Any, new: Any) -> Dict[str, List[Dict[str, Any]]]:
             pks = pk_cache[table]
             merged: Dict[str, Dict[str, Any]] = {}
             for r in out.get(table, []):
-                merged[_row_key_v15(r, pks)] = r
+                merged[_row_key_v15(r, pks, table)] = r
             for r in rows:
                 if isinstance(r, dict):
-                    merged[_row_key_v15(r, pks)] = r
+                    merged[_row_key_v15(r, pks, table)] = r
             out[table] = list(merged.values())
     return out
 
@@ -10165,7 +10174,7 @@ def _keyed_tables_v23(tables: Dict[str, Any]) -> Dict[str, List[Tuple[str, Dict[
             pairs: List[Tuple[str, Dict[str, Any]]] = []
             for row in rows:
                 if isinstance(row, dict):
-                    pairs.append((_row_key_v15(row, pks), row))
+                    pairs.append((_row_key_v15(row, pks, table), row))
             if pairs:
                 keyed[table] = pairs
     return keyed
@@ -10272,7 +10281,7 @@ def _auto_restore_on_boot_v23() -> None:
                 ready_drafts = int(
                     conn.execute("SELECT COUNT(*) FROM drafts WHERE status='ready'").fetchone()[0] or 0
                 )
-                needs_restore = drafts > 0 and questions == 0 and ready_drafts > 0
+                needs_restore = drafts > 0 and questions == 0
     if not needs_restore:
         return
     with suppress(Exception):

@@ -154,7 +154,9 @@ def load_tables() -> Dict[str, List[Dict[str, Any]]]:
         table = name[len(_ROWS_PREFIX):]
         rows: List[Dict[str, Any]] = []
         try:
-            for doc in db[name].find({}, {"d": 1}):
+            # Oldest first, newest last: the restore merger can then let the
+            # latest version win for a stable logical row key.
+            for doc in db[name].find({}, {"d": 1, "t": 1}).sort("t", 1):
                 data = doc.get("d")
                 if isinstance(data, dict):
                     rows.append(data)
