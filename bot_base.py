@@ -3135,18 +3135,77 @@ for _extra in [
 
 
 
-def normalize_visual_text(text: Any) -> str:
+# ------------------------------------------------------------------
+# Superscript / subscript preservation (v26)
+# NFKC normalisation converts ⁻¹ -> -1 and ₂ -> 2, which destroyed the
+# scientific notation coming from CSV imports.  We shield every sup/sub
+# codepoint behind private-use placeholders, run NFKC, then restore them.
+# ------------------------------------------------------------------
+SUPERSCRIPT_CHARS = "⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁼⁽⁾ⁿⁱᵃᵇᶜᵈᵉᶠᵍʰʲᵏˡᵐᵒᵖʳˢᵗᵘᵛʷˣʸᶻᴬᴮᴰᴱᴳᴴᴵᴶᴷᴸᴹᴺᴼᴾᴿᵀᵁⱽᵂ"
+SUBSCRIPT_CHARS = "₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎ₐₑₕᵢⱼₖₗₘₙₒₚᵣₛₜᵤᵥₓ"
+_SCRIPT_CHARS = SUPERSCRIPT_CHARS + SUBSCRIPT_CHARS
+_SCRIPT_SHIELD = {ch: chr(0xE000 + i) for i, ch in enumerate(_SCRIPT_CHARS)}
+_SCRIPT_UNSHIELD = {v: k for k, v in _SCRIPT_SHIELD.items()}
+_SHIELD_TABLE = str.maketrans(_SCRIPT_SHIELD)
+_UNSHIELD_TABLE = str.maketrans(_SCRIPT_UNSHIELD)
+
+_TO_SUPER = str.maketrans("0123456789+-−=()naibcdefghjklmoprstuvwxyz",
+                          "⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁻⁼⁽⁾ⁿᵃⁱᵇᶜᵈᵉᶠᵍʰʲᵏˡᵐᵒᵖʳˢᵗᵘᵛʷˣʸᶻ")
+_TO_SUB = str.maketrans("0123456789+-−=()aehijklmnoprstuvx",
+                        "₀₁₂₃₄₅₆₇₈₉₊₋₋₌₍₎ₐₑₕᵢⱼₖₗₘₙₒₚᵣₛₜᵤᵥₓ")
+
+_SUP_TAG_RE = re.compile(r"<sup>(.*?)</sup>", re.I | re.S)
+_SUB_TAG_RE = re.compile(r"<sub>(.*?)</sub>", re.I | re.S)
+_SUP_BRACE_RE = re.compile(r"\^\{([^{}\n]{1,12})\}")
+_SUB_BRACE_RE = re.compile(r"_\{([^{}\n]{1,12})\}")
+_SUP_SHORT_RE = re.compile(r"\^(-?[0-9A-Za-z+=()]{1,3})")
+_SUB_SHORT_RE = re.compile(r"(?<=[A-Za-z0-9\)\]])_(-?[0-9]{1,3})")
+
+
+def _map_script(raw: str, table: dict) -> str:
+    converted = raw.translate(table)
+    # only accept a full conversion, otherwise keep the original text intact
+    return converted if not any(c in raw for c in converted) or all(
+        ch.translate(table) != ch or not ch.strip() for ch in raw
+    ) else raw
+
+
+def promote_scientific_notation(text: Any) -> str:
+    """Turn ^2, _2, x^{-1}, <sup>/<sub> markup into real unicode scripts."""
     value = str(text or "")
+    if not value:
+        return value
+    value = _SUP_TAG_RE.sub(lambda m: _map_script(m.group(1), _TO_SUPER), value)
+    value = _SUB_TAG_RE.sub(lambda m: _map_script(m.group(1), _TO_SUB), value)
+    value = _SUP_BRACE_RE.sub(lambda m: _map_script(m.group(1), _TO_SUPER), value)
+    value = _SUB_BRACE_RE.sub(lambda m: _map_script(m.group(1), _TO_SUB), value)
+    value = _SUP_SHORT_RE.sub(lambda m: _map_script(m.group(1), _TO_SUPER), value)
+    value = _SUB_SHORT_RE.sub(lambda m: _map_script(m.group(1), _TO_SUB), value)
+    return value
+
+
+def shield_scripts(text: str) -> str:
+    return str(text or "").translate(_SHIELD_TABLE)
+
+
+def unshield_scripts(text: str) -> str:
+    return str(text or "").translate(_UNSHIELD_TABLE)
+
+
+def normalize_visual_text(text: Any) -> str:
+    value = promote_scientific_notation(text)
+    value = shield_scripts(value)
     value = unicodedata.normalize("NFKC", value)
     # map invisible fillers to normal spaces first
     for ch in ["\u3164", "\u115F", "\u1160", "\u2800"]:
         value = value.replace(ch, " ")
     # remove zero-width and control-ish formatting chars
-    for ch in ["\u200B", "\u200C", "\u200D", "\u2060", "\uFEFF", "\u00AD"]:
+    for ch in ["\u200B", "\u2060", "\uFEFF", "\u00AD"]:
         value = value.replace(ch, "")
     value = value.replace("\t", " ").replace("\r", "")
     value = re.sub(r"\s+", " ", value)
-    return value.strip()
+    return unshield_scripts(value).strip()
+
 
 
 def _is_bengali(ch: str) -> bool:
