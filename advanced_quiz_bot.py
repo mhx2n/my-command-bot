@@ -98,6 +98,26 @@ base.DBH.executescript(
     );
     """
 )
+
+
+def _ensure_question_identity() -> None:
+    """Make a question's exam + serial its durable database identity."""
+    with closing(base.DBH.connect()) as conn:
+        # Older cumulative restores could create the same logical question
+        # under different local AUTOINCREMENT ids. Keep the newest copy once,
+        # then enforce the invariant for every future import/restore.
+        conn.execute(
+            "DELETE FROM draft_questions WHERE id NOT IN ("
+            "SELECT MAX(id) FROM draft_questions GROUP BY draft_id, q_no)"
+        )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_draft_questions_identity "
+            "ON draft_questions(draft_id, q_no)"
+        )
+        conn.commit()
+
+
+_ensure_question_identity()
 ensure_column("sessions", "speed_factor", "REAL DEFAULT 1.0")
 ensure_column("sessions", "speed_mode", "TEXT DEFAULT 'normal'")
 ensure_column("sessions", "paused_at", "INTEGER")
@@ -9197,12 +9217,28 @@ def _apply_tables_v15(tables: Any) -> int:
                 if not isinstance(row, dict):
                     continue
                 cols = [c for c in columns if c in row]
+                logical_upsert: List[str] = []
+                if table == "draft_questions":
+                    logical_upsert = ["draft_id", "q_no"]
+                    cols = [c for c in cols if c != "id"]
+                elif table == "session_questions":
+                    logical_upsert = ["session_id", "q_no"]
+                    cols = [c for c in cols if c != "id"]
                 if not cols:
                     continue
-                sql = (
-                    f"INSERT OR REPLACE INTO {table}({','.join(cols)}) "
-                    f"VALUES({','.join('?' for _ in cols)})"
-                )
+                if logical_upsert and all(c in cols for c in logical_upsert):
+                    updates = [c for c in cols if c not in logical_upsert]
+                    update_sql = ",".join(f"{c}=excluded.{c}" for c in updates)
+                    sql = (
+                        f"INSERT INTO {table}({','.join(cols)}) "
+                        f"VALUES({','.join('?' for _ in cols)}) "
+                        f"ON CONFLICT({','.join(logical_upsert)}) DO UPDATE SET {update_sql}"
+                    )
+                else:
+                    sql = (
+                        f"INSERT OR REPLACE INTO {table}({','.join(cols)}) "
+                        f"VALUES({','.join('?' for _ in cols)})"
+                    )
                 try:
                     conn.execute(sql, tuple(row.get(c) for c in cols))
                     restored += 1
