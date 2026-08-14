@@ -9974,6 +9974,75 @@ def _build_app_v17():
 
 base.build_app = _build_app_v17
 
+# ============================================================
+# Patch v21 — HTML exam: clean result headline, unbroken Bangla,
+#             and long-title-safe responsive layout
+# ============================================================
+
+_MATH_DELIMS_V21 = ('\\(', '\\)', '\\[', '\\]')
+
+
+def _strip_math_delims_v21(text: str) -> str:
+    """Remove LaTeX delimiters from prose so MathJax never touches Bangla."""
+    value = str(text or '')
+    for token in _MATH_DELIMS_V21:
+        value = value.replace(token, '')
+    # Lone/unpaired dollar signs around plain prose break shaping too.
+    if value.count('$') and not re.search(r'\$[^$]*[A-Za-z0-9\\^_][^$]*\$', value):
+        value = value.replace('$', '')
+    return value
+
+
+_orig_html_from_display_text_v21 = _html_from_display_text
+
+
+def _html_from_display_text(raw: str) -> str:  # type: ignore[no-redef]
+    return _orig_html_from_display_text_v21(_strip_math_delims_v21(raw))
+
+
+_orig_render_scroll_exam_html_v21 = render_scroll_exam_html
+
+
+def render_scroll_exam_html(draft: Any, owner_id: int) -> str:  # type: ignore[no-redef]
+    html = _orig_render_scroll_exam_html_v21(draft, owner_id)
+
+    # 1) Result headline shows ONLY the student name (title already above it).
+    html = re.sub(
+        r"\$\('resultName'\)\.textContent\s*=\s*(?:`[^`]*`|\([^;]*\)|[^;]*);",
+        "$('resultName').textContent=($('studentName').value.trim()||'Student');",
+        html,
+    )
+
+    # 2) MathJax must typeset ONLY explicit math nodes — never Bangla prose.
+    html = html.replace(
+        "window.MathJax={",
+        "window.MathJax={options:{processHtmlClass:'math',ignoreHtmlClass:'.*'},",
+        1,
+    )
+
+    # 3) Long titles must never eat the question area on phone or desktop.
+    html = html.replace(
+        "</style>",
+        "\n/* ---- Patch v21: safe titles + readable Bangla ---- */\n"
+        ".topbar .inner{align-items:center;gap:12px}\n"
+        ".topbar .brand{min-width:0;flex:1 1 auto}\n"
+        ".topbar .brand h1{font-size:clamp(14px,3.4vw,20px)!important;line-height:1.3;"
+        "margin:2px 0 0;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;"
+        "overflow:hidden;overflow-wrap:anywhere}\n"
+        ".topbar .timer,.timer-box{flex:0 0 auto}\n"
+        ".headline{font-size:clamp(19px,4.6vw,32px)!important;line-height:1.32;"
+        "display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden;"
+        "overflow-wrap:anywhere}\n"
+        ".result-title{font-size:clamp(20px,4.6vw,30px)!important;line-height:1.3;"
+        "overflow-wrap:anywhere}\n"
+        ".q-text,.opt-body,.review-q,.answer-line{overflow-wrap:anywhere;"
+        "line-height:1.75;font-feature-settings:'liga' 1,'clig' 1,'kern' 1}\n"
+        "mjx-container[jax='SVG']{max-width:100%;overflow-x:auto}\n"
+        "</style>",
+        1,
+    )
+    return html
+
 
 if __name__ == "__main__":
     base.main()
