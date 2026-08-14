@@ -9475,6 +9475,81 @@ def render_scroll_exam_html(draft: Any, owner_id: int) -> str:  # type: ignore[n
     return html
 
 
+# ============================================================
+# Patch v20 — deep accent everywhere + clean result name
+# ============================================================
+
+def _deepen_hex_v20(hex_color: str) -> str:
+    raw = (hex_color or '').strip().lstrip('#')
+    if len(raw) == 3:
+        raw = ''.join(c * 2 for c in raw)
+    if len(raw) != 6:
+        return '#0f7a3d'
+    try:
+        r, g, b = (int(raw[i:i + 2], 16) for i in (0, 2, 4))
+    except ValueError:
+        return '#0f7a3d'
+    # Darken until the colour is deep enough for white text on it.
+    for _ in range(40):
+        lum = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0
+        if lum <= 0.30:
+            break
+        r, g, b = (int(r * 0.90), int(g * 0.90), int(b * 0.90))
+    # Keep it vivid, never muddy grey.
+    mx = max(r, g, b, 1)
+    boost = min(1.35, 190.0 / mx) if mx < 140 else 1.0
+    r, g, b = (min(255, int(r * boost)), min(255, int(g * boost)), min(255, int(b * boost)))
+    return '#%02x%02x%02x' % (r, g, b)
+
+
+_orig_export_theme_palette_v20 = _export_theme_palette
+
+
+def _export_theme_palette(owner_id: int, draft: Any) -> Dict[str, str]:  # type: ignore[no-redef]
+    palette = _orig_export_theme_palette_v20(owner_id, draft)
+    deep = _deepen_hex_v20(str(palette.get('accent', '')))
+    palette['accent'] = deep
+    r, g, b = (int(deep[1:3], 16), int(deep[3:5], 16), int(deep[5:7], 16))
+    palette['accent_soft'] = f'rgba({r},{g},{b},.16)'
+    return palette
+
+
+_orig_render_scroll_exam_html_v20 = render_scroll_exam_html
+
+
+def render_scroll_exam_html(draft: Any, owner_id: int) -> str:  # type: ignore[no-redef]
+    html = _orig_render_scroll_exam_html_v20(draft, owner_id)
+    # Result headline: student name only (exam title already shown above it).
+    html = html.replace(
+        "`${$('studentName').value.trim() || 'Student'} — ${'__TITLE_TEXT__'}`",
+        "($('studentName').value.trim() || 'Student')",
+    )
+    html = html.replace(
+        "`${$('studentName').value.trim()||'Student'} — __TITLE_TEXT__`",
+        "($('studentName').value.trim()||'Student')",
+    )
+    # Deep accent for every accent-tinted text/surface.
+    html = html.replace(
+        "</style>",
+        "\n/* ---- Patch v20: deep accent text ---- */\n"
+        ".score-ring,.q-index,.brand-line,.brand-tag,.tab.active,.btn.primary,.fab.primary"
+        "{filter:saturate(1.05)}\n"
+        "body[data-theme='light'] .score-ring,body[data-theme='light'] .q-index,"
+        "body[data-theme='light'] .brand-line{color:var(--accent)!important}\n"
+        "body[data-theme='light'] .btn.primary,body[data-theme='light'] .fab.primary,"
+        "body[data-theme='light'] .tab.active,body[data-theme='light'] .brand-tag"
+        "{background:var(--accent)!important;color:#ffffff!important}\n"
+        "body[data-theme='dark'] .btn.primary,body[data-theme='dark'] .fab.primary,"
+        "body[data-theme='dark'] .tab.active,body[data-theme='dark'] .brand-tag"
+        "{background:var(--accent)!important;color:#ffffff!important}\n"
+        "</style>",
+        1,
+    )
+    return html
+
+
+
+
 
 
 # ============================================================
