@@ -98,6 +98,26 @@ base.DBH.executescript(
     );
     """
 )
+
+
+def _ensure_question_identity() -> None:
+    """Make a question's exam + serial its durable database identity."""
+    with closing(base.DBH.connect()) as conn:
+        # Older cumulative restores could create the same logical question
+        # under different local AUTOINCREMENT ids. Keep the newest copy once,
+        # then enforce the invariant for every future import/restore.
+        conn.execute(
+            "DELETE FROM draft_questions WHERE id NOT IN ("
+            "SELECT MAX(id) FROM draft_questions GROUP BY draft_id, q_no)"
+        )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_draft_questions_identity "
+            "ON draft_questions(draft_id, q_no)"
+        )
+        conn.commit()
+
+
+_ensure_question_identity()
 ensure_column("sessions", "speed_factor", "REAL DEFAULT 1.0")
 ensure_column("sessions", "speed_mode", "TEXT DEFAULT 'normal'")
 ensure_column("sessions", "paused_at", "INTEGER")
@@ -7299,7 +7319,18 @@ def export_backup_payload_v8() -> Dict[str, Any]:
         "tables": {},
     }
     with closing(base.DBH.connect()) as conn:
-        for table in BACKUP_TABLES_V8:
+        # Include every application table, including tables introduced by
+        # later patches.  Keeping only a hand-maintained list previously made
+        # newly-added question metadata silently disappear from backups.
+        discovered = [
+            str(r[0])
+            for r in conn.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+            ).fetchall()
+        ]
+        tables_to_export = list(dict.fromkeys(BACKUP_TABLES_V8 + discovered))
+        for table in tables_to_export:
             if not _table_exists_v8(conn, table):
                 continue
             rows = conn.execute(f"SELECT * FROM {table}").fetchall()
@@ -9057,9 +9088,18 @@ def _pk_cols_v15(conn: Any, table: str) -> List[str]:
     return [str(r[1]) for r in info if int(r[5] or 0) > 0]
 
 
-def _row_key_v15(row: Dict[str, Any], pks: List[str]) -> str:
-    if pks and all(c in row for c in pks):
-        return "pk::" + "\u0001".join(str(row.get(c)) for c in pks)
+def _row_key_v15(row: Dict[str, Any], pks: List[str], table: str = "") -> str:
+    # AUTOINCREMENT ids are local to one SQLite file and can be reused after a
+    # restart/reset.  Stable domain keys keep unrelated questions from
+    # overwriting each other in cumulative GitHub/Mongo backups.
+    logical_keys = {
+        "draft_questions": ["draft_id", "q_no"],
+        "session_questions": ["session_id", "q_no"],
+        "draft_sections": ["draft_id", "section_no"],
+    }
+    keys = logical_keys.get(table, pks)
+    if keys and all(c in row for c in keys):
+        return "pk::" + "\u0001".join(str(row.get(c)) for c in keys)
     try:
         return "row::" + json.dumps(row, sort_keys=True, ensure_ascii=False, default=str)
     except Exception:
@@ -9085,10 +9125,10 @@ def _merge_tables_v15(old: Any, new: Any) -> Dict[str, List[Dict[str, Any]]]:
             pks = pk_cache[table]
             merged: Dict[str, Dict[str, Any]] = {}
             for r in out.get(table, []):
-                merged[_row_key_v15(r, pks)] = r
+                merged[_row_key_v15(r, pks, table)] = r
             for r in rows:
                 if isinstance(r, dict):
-                    merged[_row_key_v15(r, pks)] = r
+                    merged[_row_key_v15(r, pks, table)] = r
             out[table] = list(merged.values())
     return out
 
@@ -9152,8 +9192,24 @@ def _apply_tables_v15(tables: Any) -> int:
     if not isinstance(tables, dict):
         return 0
     restored = 0
+    failed = 0
+    failed_tables: Dict[str, int] = {}
+    # MongoDB collections are returned in an undefined order.  Restore parent
+    # rows first so SQLite foreign keys cannot discard questions/answers before
+    # their draft/session exists.
+    restore_order = [
+        "bot_admins", "known_users", "known_chats", "drafts",
+        "draft_sections", "user_visuals", "bot_settings", "user_state",
+        "active_drafts", "group_bindings", "practice_links",
+        "practice_attempts", "sessions", "draft_questions",
+        "session_questions", "participants", "answers", "schedules",
+        "user_quiz_filters", "admin_chat_access", "audit_logs", "delete_queue",
+    ]
+    ordered_tables = [name for name in restore_order if name in tables]
+    ordered_tables.extend(name for name in tables if name not in ordered_tables)
     with closing(base.DBH.connect()) as conn:
-        for table, rows in tables.items():
+        for table in ordered_tables:
+            rows = tables.get(table)
             if not isinstance(rows, list) or not _table_exists_v8(conn, table):
                 continue
             columns = _table_columns_v8(conn, table)
@@ -9161,21 +9217,43 @@ def _apply_tables_v15(tables: Any) -> int:
                 if not isinstance(row, dict):
                     continue
                 cols = [c for c in columns if c in row]
+                logical_upsert: List[str] = []
+                if table == "draft_questions":
+                    logical_upsert = ["draft_id", "q_no"]
+                    cols = [c for c in cols if c != "id"]
+                elif table == "session_questions":
+                    logical_upsert = ["session_id", "q_no"]
+                    cols = [c for c in cols if c != "id"]
                 if not cols:
                     continue
-                sql = (
-                    f"INSERT OR REPLACE INTO {table}({','.join(cols)}) "
-                    f"VALUES({','.join('?' for _ in cols)})"
-                )
+                if logical_upsert and all(c in cols for c in logical_upsert):
+                    updates = [c for c in cols if c not in logical_upsert]
+                    update_sql = ",".join(f"{c}=excluded.{c}" for c in updates)
+                    sql = (
+                        f"INSERT INTO {table}({','.join(cols)}) "
+                        f"VALUES({','.join('?' for _ in cols)}) "
+                        f"ON CONFLICT({','.join(logical_upsert)}) DO UPDATE SET {update_sql}"
+                    )
+                else:
+                    sql = (
+                        f"INSERT OR REPLACE INTO {table}({','.join(cols)}) "
+                        f"VALUES({','.join('?' for _ in cols)})"
+                    )
                 try:
                     conn.execute(sql, tuple(row.get(c) for c in cols))
                     restored += 1
-                except Exception:
+                except Exception as exc:
+                    failed += 1
+                    failed_tables[table] = failed_tables.get(table, 0) + 1
+                    if failed_tables[table] == 1:
+                        base.logger.warning("Restore row failed for %s: %s", table, exc)
                     continue
         conn.commit()
     for row in (tables.get("user_visuals") or []):
         with suppress(Exception):
             base.restore_thumbnail_file_from_github(int(row.get("user_id")), row.get("thumb_github_path"))
+    if failed:
+        base.logger.warning("Restore completed with %s failed rows: %s", failed, failed_tables)
     return restored
 
 
@@ -10143,7 +10221,7 @@ def _keyed_tables_v23(tables: Dict[str, Any]) -> Dict[str, List[Tuple[str, Dict[
             pairs: List[Tuple[str, Dict[str, Any]]] = []
             for row in rows:
                 if isinstance(row, dict):
-                    pairs.append((_row_key_v15(row, pks), row))
+                    pairs.append((_row_key_v15(row, pks, table), row))
             if pairs:
                 keyed[table] = pairs
     return keyed
@@ -10238,12 +10316,25 @@ _restore_everything_v15 = _restore_everything_v23  # type: ignore[assignment]
 def _auto_restore_on_boot_v23() -> None:
     if not (_gh_only_ready_v23() or _mongo_ready_v23()):
         return
-    if not _db_is_empty_v15():
+    needs_restore = _db_is_empty_v15()
+    if not needs_restore:
+        # Repair the exact partial-restore state caused by older versions:
+        # draft metadata/practice links survived, but every question insert was
+        # rejected because Mongo collections arrived before their parent rows.
+        with suppress(Exception):
+            with closing(base.DBH.connect()) as conn:
+                drafts = int(conn.execute("SELECT COUNT(*) FROM drafts").fetchone()[0] or 0)
+                questions = int(conn.execute("SELECT COUNT(*) FROM draft_questions").fetchone()[0] or 0)
+                ready_drafts = int(
+                    conn.execute("SELECT COUNT(*) FROM drafts WHERE status='ready'").fetchone()[0] or 0
+                )
+                needs_restore = drafts > 0 and questions == 0
+    if not needs_restore:
         return
     with suppress(Exception):
         ok, rows = _restore_everything_v23()
         if ok:
-            base.logger.info("Boot restore: %s rows recovered (GitHub + MongoDB).", rows)
+            base.logger.info("Boot restore/repair: %s rows recovered (GitHub + MongoDB).", rows)
 
 
 # ------------------------------------------------------------

@@ -96,6 +96,7 @@ def push_tables(keyed: Dict[str, List[Tuple[str, Dict[str, Any]]]]) -> Dict[str,
 
     total = 0
     tables = 0
+    errors: List[str] = []
     now = int(time.time())
     for table, pairs in (keyed or {}).items():
         if not pairs:
@@ -110,13 +111,18 @@ def push_tables(keyed: Dict[str, List[Tuple[str, Dict[str, Any]]]]) -> Dict[str,
         if not ops:
             continue
         coll = db[_ROWS_PREFIX + table]
+        saved = 0
         for i in range(0, len(ops), 500):
             try:
-                coll.bulk_write(ops[i:i + 500], ordered=False)
+                batch = ops[i:i + 500]
+                coll.bulk_write(batch, ordered=False)
+                saved += len(batch)
             except Exception as exc:
                 logger.warning("Mongo bulk_write failed for %s: %s", table, exc)
-        total += len(ops)
-        tables += 1
+                errors.append(f"{table}: {exc}")
+        total += saved
+        if saved:
+            tables += 1
     try:
         db[_META].update_one(
             {"_id": "backup"},
@@ -125,7 +131,12 @@ def push_tables(keyed: Dict[str, List[Tuple[str, Dict[str, Any]]]]) -> Dict[str,
         )
     except Exception:
         pass
-    return {"rows": total, "tables": tables, "ok": True, "error": ""}
+    return {
+        "rows": total,
+        "tables": tables,
+        "ok": not errors,
+        "error": "; ".join(errors[:3]),
+    }
 
 
 def load_tables() -> Dict[str, List[Dict[str, Any]]]:
@@ -143,7 +154,9 @@ def load_tables() -> Dict[str, List[Dict[str, Any]]]:
         table = name[len(_ROWS_PREFIX):]
         rows: List[Dict[str, Any]] = []
         try:
-            for doc in db[name].find({}, {"d": 1}):
+            # Oldest first, newest last: the restore merger can then let the
+            # latest version win for a stable logical row key.
+            for doc in db[name].find({}, {"d": 1, "t": 1}).sort("t", 1):
                 data = doc.get("d")
                 if isinstance(data, dict):
                     rows.append(data)
